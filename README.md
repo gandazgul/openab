@@ -66,7 +66,7 @@ webhook platforms and `WS/webhook` for Feishu/Lark.
 - **Scheduled messages** — config-driven cron jobs for automated agent prompts ([docs/cronjob.md](docs/cronjob.md))
 - **Slash commands** — built-in slash command support ([docs/slash-commands.md](docs/slash-commands.md))
 - **Session pool** — one CLI process per thread, auto-managed lifecycle
-- **ACP protocol** — JSON-RPC over stdio with tool call, thinking, and permission auto-reply support
+- **ACP protocol** — JSON-RPC over stdio with tool call, thinking, permission auto-reply, and Discord form elicitation support
 - **Kubernetes-ready** — Dockerfile + k8s manifests with PVC for auth persistence
 - **Voice message STT** — auto-transcribes Discord voice messages via Groq, OpenAI, or local Whisper server ([docs/stt.md](docs/stt.md))
 - **Lifecycle hooks** — run custom scripts at startup (`pre_boot`) and shutdown (`pre_shutdown`) for bootstrapping, S3 sync, and state backup ([docs/hooks.md](docs/hooks.md))

@@ -1,6 +1,29 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum JsonRpcId {
+    Number(i64),
+    String(String),
+    Null,
+}
+
+impl JsonRpcId {
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            Self::Number(id) if *id >= 0 => Some(*id as u64),
+            Self::Number(_) | Self::String(_) | Self::Null => None,
+        }
+    }
+}
+
+impl From<u64> for JsonRpcId {
+    fn from(value: u64) -> Self {
+        Self::Number(value as i64)
+    }
+}
+
 // --- Outgoing ---
 
 #[derive(Debug, Serialize)]
@@ -26,15 +49,15 @@ impl JsonRpcRequest {
 #[derive(Debug, Serialize)]
 pub struct JsonRpcResponse {
     pub jsonrpc: &'static str,
-    pub id: u64,
+    pub id: JsonRpcId,
     pub result: Value,
 }
 
 impl JsonRpcResponse {
-    pub fn new(id: u64, result: Value) -> Self {
+    pub fn new(id: impl Into<JsonRpcId>, result: Value) -> Self {
         Self {
             jsonrpc: "2.0",
-            id,
+            id: id.into(),
             result,
         }
     }
@@ -44,7 +67,7 @@ impl JsonRpcResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcMessage {
-    pub id: Option<u64>,
+    pub id: Option<JsonRpcId>,
     pub method: Option<String>,
     pub result: Option<Value>,
     pub error: Option<JsonRpcError>,
@@ -230,9 +253,15 @@ pub fn parse_turn_result(result: &Value) -> TurnResult {
         .and_then(|v| v.as_str())
         .map(String::from);
     let usage = result.get("usage");
-    let input_tokens = usage.and_then(|u| u.get("inputTokens")).and_then(|v| v.as_u64());
-    let output_tokens = usage.and_then(|u| u.get("outputTokens")).and_then(|v| v.as_u64());
-    let total_tokens = usage.and_then(|u| u.get("totalTokens")).and_then(|v| v.as_u64());
+    let input_tokens = usage
+        .and_then(|u| u.get("inputTokens"))
+        .and_then(|v| v.as_u64());
+    let output_tokens = usage
+        .and_then(|u| u.get("outputTokens"))
+        .and_then(|v| v.as_u64());
+    let total_tokens = usage
+        .and_then(|u| u.get("totalTokens"))
+        .and_then(|v| v.as_u64());
     TurnResult {
         stop_reason,
         input_tokens,
@@ -281,7 +310,11 @@ pub struct UsageReport {
 /// Returns `None` when `success` is not true or the data shape is missing —
 /// callers should treat that as "usage not supported by this agent".
 pub fn parse_usage_report(result: &Value) -> Option<UsageReport> {
-    if !result.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if !result
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         return None;
     }
     let data = result.get("data")?;
@@ -307,9 +340,7 @@ pub fn parse_usage_report(result: &Value) -> Option<UsageReport> {
                     let has_limit = b
                         .get("hasLimit")
                         .and_then(|v| v.as_bool())
-                        .unwrap_or_else(|| {
-                            b.get("limit").and_then(|v| v.as_f64()).is_some()
-                        });
+                        .unwrap_or_else(|| b.get("limit").and_then(|v| v.as_f64()).is_some());
                     Some(UsageBreakdown {
                         display_name: b.get("displayName")?.as_str()?.to_string(),
                         used: b.get("used")?.as_f64()?,

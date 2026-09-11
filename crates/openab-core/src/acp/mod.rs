@@ -1,6 +1,7 @@
 #[cfg(feature = "agentcore")]
 pub mod agentcore;
 pub mod connection;
+pub mod elicitation;
 pub mod pool;
 pub mod protocol;
 

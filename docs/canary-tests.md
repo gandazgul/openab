@@ -166,6 +166,18 @@ OPENAB_ACP_TOKEN=<key> uv run scripts/acp-ws-smoke.py ws://<host>:8080/acp
 
 Exits non-zero unless every check passes. For the in-repo `cargo test` counterpart (offline wire-conformance + handler-level + streaming tests), see the `acp_conformance`, `acp_handlers`, and `acp_streaming` modules in `crates/openab-gateway/src/adapters/acp_server.rs`.
 
+### Downstream ACP form elicitation
+
+For a pull request that changes downstream ACP form elicitation, first run the deterministic subprocess test. It uses the production `AcpConnection` stdio boundary and a fake Agent Runtime. It does not need a model, network, Discord token, or live Discord API.
+
+```bash
+cargo test -p openab-core --test acp_form_elicitation -- --nocapture
+```
+
+The test must show that Discord-backed sessions advertise `clientCapabilities.elicitation.form`, unsupported sessions omit `clientCapabilities.elicitation`, `elicitation/create` waits for the presenter, same-ID reverse requests do not complete the active `session/prompt`, overload requests get bounded errors, and the prompt still completes. Focused `elicitation` tests must also traverse long paged Discord form text and text fallback commands.
+
+For a live Discord canary, use a disposable bot and channel. Trigger a form with string, number, integer, boolean, single-select, and multi-select fields. Confirm review and modification work. Confirm invalid values do not send an ACP response. Confirm users outside the active turn get an ephemeral denial. Trigger a long form and move to the last page; confirm no prompt, choice, default, error, or review text is missing. Trigger text fallback and complete it with `!form next`, `!form prev`, `!form choose N`, `!form edit N`, `!form submit`, `!form decline`, and `!form cancel`. After Submit, Decline, Cancel, `/cancel`, `/reset`, and timeout, click old controls and reply to the old form message. No second ACP response must be written.
+
 ### Transport Method
 
 1. Start the preview container with stdin open and the agent binary as its entrypoint. Mount only isolated test credentials and a disposable workspace. The bidirectional client should spawn an equivalent command rather than pipe a fixed list of messages into it. For the Codex preview image:

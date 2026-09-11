@@ -1,10 +1,14 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{error, warn};
 
-use crate::acp::{classify_notification, parse_turn_result, AcpEvent, ContentBlock, SessionPool, TurnResult};
+use crate::acp::elicitation::FormPresenter;
+use crate::acp::{
+    classify_notification, parse_turn_result, AcpEvent, ContentBlock, SessionPool, TurnResult,
+};
 use crate::config::{ReactionsConfig, ToolDisplay};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
@@ -72,7 +76,12 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
                         "reply_to" => {
                             let v = value.trim();
                             // Validate: non-empty, reasonable length, no whitespace/control chars
-                            if !v.is_empty() && v.len() <= 64 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_') {
+                            if !v.is_empty()
+                                && v.len() <= 64
+                                && v.chars().all(|c| {
+                                    c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'
+                                })
+                            {
                                 directives.reply_to = Some(v.to_string());
                             }
                         }
@@ -224,6 +233,20 @@ pub(crate) fn finalize_body(
     }
 }
 
+fn human_authority_from_sender_json(sender_json: &str) -> HashSet<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(sender_json) else {
+        return HashSet::new();
+    };
+    if value.get("is_bot").and_then(serde_json::Value::as_bool) == Some(true) {
+        return HashSet::new();
+    }
+    value
+        .get("sender_id")
+        .and_then(serde_json::Value::as_str)
+        .map(|id| HashSet::from([id.to_string()]))
+        .unwrap_or_default()
+}
+
 // --- Platform-agnostic types ---
 
 /// Identifies a channel or thread across platforms.
@@ -340,6 +363,11 @@ pub trait ChatAdapter: Send + Sync + 'static {
     /// replies into multiple messages at this bound. Platform-specific (e.g. 2000
     /// for Discord; Slack uses its Block Kit `markdown` block cap).
     fn message_limit(&self) -> usize;
+
+    /// Optional presenter for ACP form elicitation. Unsupported adapters return None.
+    fn form_presenter(&self) -> Option<Arc<dyn FormPresenter>> {
+        None
+    }
 
     /// Send a new message, returns a reference to the sent message.
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef>;
@@ -615,7 +643,11 @@ impl AdapterRouter {
                 .unwrap_or(&ctx.thread_channel.channel_id)
         );
 
-        if let Err(e) = self.pool.get_or_create(&thread_key, None).await {
+        if let Err(e) = self
+            .pool
+            .get_or_create(&thread_key, None, adapter.form_presenter())
+            .await
+        {
             let msg = format_user_error(&e.to_string());
             let _ = adapter
                 .send_message(&ctx.thread_channel, &format!("⚠️ {msg}"))
@@ -641,13 +673,18 @@ impl AdapterRouter {
         }
 
         let result = self
-            .stream_prompt(
+            .stream_prompt_blocks(
                 adapter,
                 &thread_key,
                 content_blocks,
                 &ctx.thread_channel,
+                ctx.trigger_msg.clone(),
+                human_authority_from_sender_json(&ctx.sender_json),
                 reactions.clone(),
                 ctx.other_bot_present,
+                // handle_message path (e.g. cron) is never Slack assistant-mode native
+                // streaming, so no per-turn recipient; it degrades to post+edit if used.
+                None,
             )
             .await;
 
@@ -680,29 +717,6 @@ impl AdapterRouter {
         result
     }
 
-    async fn stream_prompt(
-        &self,
-        adapter: &Arc<dyn ChatAdapter>,
-        thread_key: &str,
-        content_blocks: Vec<ContentBlock>,
-        thread_channel: &ChannelRef,
-        reactions: Arc<StatusReactionController>,
-        other_bot_present: bool,
-    ) -> Result<()> {
-        self.stream_prompt_blocks(
-            adapter,
-            thread_key,
-            content_blocks,
-            thread_channel,
-            reactions,
-            other_bot_present,
-            // handle_message path (e.g. cron) is never Slack assistant-mode native
-            // streaming, so no per-turn recipient — degrades to post+edit if it were.
-            None,
-        )
-        .await
-    }
-
     /// Drive one ACP turn with the given pre-packed ContentBlocks.
     /// Called by both `handle_message` (per-message mode) and `dispatch::dispatch_batch`
     /// (batched mode).
@@ -713,12 +727,16 @@ impl AdapterRouter {
         thread_key: &str,
         content_blocks: Vec<ContentBlock>,
         thread_channel: &ChannelRef,
+        trigger_msg: MessageRef,
+        authorized_user_ids: HashSet<String>,
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
         recipient: Option<(String, String)>,
     ) -> Result<()> {
         let adapter = adapter.clone();
         let thread_channel = thread_channel.clone();
+        let trigger_msg = trigger_msg.clone();
+        let authorized_user_ids = authorized_user_ids.clone();
         let message_limit = reply_message_limit(&thread_channel.platform, adapter.message_limit());
         // Decide streaming explicitly by platform, not by whatever the unified
         // adapter's Telegram flag happens to be. ACP streams append-only deltas
@@ -760,7 +778,14 @@ impl AdapterRouter {
                     let reset = conn.session_reset;
                     conn.session_reset = false;
 
-                    let (mut rx, request_id) = conn.session_prompt(content_blocks).await?;
+                    let (mut rx, request_id) = conn
+                        .session_prompt(
+                            content_blocks,
+                            thread_channel.clone(),
+                            trigger_msg.clone(),
+                            authorized_user_ids.clone(),
+                        )
+                        .await?;
                     if assistant_status {
                         let _ = adapter.set_status(&thread_channel, "Thinking…").await;
                     } else {
@@ -930,7 +955,11 @@ impl AdapterRouter {
                                 continue;
                             }
                         };
-                        if let Some(notification_id) = notification.id {
+                        if let Some(notification_id) = notification
+                            .id
+                            .as_ref()
+                            .and_then(crate::acp::protocol::JsonRpcId::as_u64)
+                        {
                             if notification_id != request_id {
                                 // Stale response from a previously-abandoned prompt.
                                 // No automated test seam: this path only triggers when a
@@ -1388,16 +1417,17 @@ fn contains_bot_mention(content: &str) -> bool {
     while i + 2 < bytes.len() {
         if bytes[i] == b'<' && bytes[i + 1] == b'@' {
             // Skip optional '!' (nickname mention) or '&' (role mention)
-            let start = if i + 2 < bytes.len()
-                && (bytes[i + 2] == b'!' || bytes[i + 2] == b'&')
-            {
+            let start = if i + 2 < bytes.len() && (bytes[i + 2] == b'!' || bytes[i + 2] == b'&') {
                 i + 3
             } else {
                 i + 2
             };
             if start < bytes.len() && bytes[start].is_ascii_digit() {
                 if let Some(end) = content[start..].find('>') {
-                    if content[start..start + end].chars().all(|c| c.is_ascii_digit()) {
+                    if content[start..start + end]
+                        .chars()
+                        .all(|c| c.is_ascii_digit())
+                    {
                         return true;
                     }
                 }
@@ -1626,8 +1656,7 @@ fn compose_display(
                         // matches the sibling finished-fallback summary and
                         // the pre-PR raw-count behaviour that users are used
                         // to. A hidden group of `a×2` contributes 2, not 1.
-                        let hidden_groups =
-                            running_groups.len() - TOOL_COLLAPSE_THRESHOLD;
+                        let hidden_groups = running_groups.len() - TOOL_COLLAPSE_THRESHOLD;
                         let hidden_calls: usize = running_groups
                             .iter()
                             .take(hidden_groups)
@@ -1736,7 +1765,11 @@ fn propagate_mentions_to_chunks(
             } else {
                 let footer = format!(
                     "\n{}",
-                    missing.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(" ")
+                    missing
+                        .iter()
+                        .map(|m| m.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
                 );
                 if chunk.chars().count() + footer.chars().count() <= limit {
                     format!("{chunk}{footer}")
@@ -1761,7 +1794,10 @@ mod tests {
         assert_eq!(reply_message_limit("slack", 4096), 4096);
         // and a long reply under the ACP limit is a single chunk (delivered whole)
         let long = "x".repeat(50_000);
-        assert_eq!(crate::format::split_message(&long, reply_message_limit("acp", 4096)).len(), 1);
+        assert_eq!(
+            crate::format::split_message(&long, reply_message_limit("acp", 4096)).len(),
+            1
+        );
     }
 
     #[test]
@@ -2101,7 +2137,10 @@ mod tests {
             tool("3", "grep", ToolState::Completed),
         ];
         let out = compose_display(&tools, "done", false, ToolDisplay::Full);
-        assert!(!out.contains("(×"), "should not collapse across order: {out}");
+        assert!(
+            !out.contains("(×"),
+            "should not collapse across order: {out}"
+        );
         assert_eq!(out.matches("`grep`").count(), 2, "output: {out}");
         assert_eq!(out.matches("`curl`").count(), 1, "output: {out}");
     }

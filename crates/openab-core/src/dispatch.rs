@@ -8,7 +8,7 @@
 //! - I3: Broker structural fidelity — no merging, splitting, reordering, or
 //!   semantic transformation of arrival events.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -35,6 +35,10 @@ pub struct BufferedMessage {
     /// fields (per-event tracing in `dispatch_batch`) don't pay a JSON parse.
     /// Per ADR §2.3 each arrival event carries its sender name.
     pub sender_name: String,
+    /// Typed admitted sender ID. Used to authorize reverse ACP elicitations.
+    pub sender_id: String,
+    /// Whether the admitted sender is a bot. Bot senders cannot answer form elicitations.
+    pub sender_is_bot: bool,
     /// User-visible prompt text (verbatim, never transformed).
     pub prompt: String,
     /// Attachment blocks (images, STT transcripts) in arrival order.
@@ -132,7 +136,12 @@ pub trait DispatchTarget: Send + Sync + 'static {
 
     /// Ensure the ACP session for `session_key` exists (idempotent).
     /// Returns `true` if a new session was created, `false` if it already existed.
-    async fn ensure_session(&self, session_key: &str, working_dir: Option<&str>) -> Result<bool>;
+    async fn ensure_session(
+        &self,
+        session_key: &str,
+        working_dir: Option<&str>,
+        form_presenter: Option<Arc<dyn crate::acp::elicitation::FormPresenter>>,
+    ) -> Result<bool>;
 
     /// Destroy the session for `session_key` (used to rollback on directive failure).
     async fn reset_session(&self, session_key: &str);
@@ -145,6 +154,8 @@ pub trait DispatchTarget: Send + Sync + 'static {
         session_key: &str,
         content_blocks: Vec<ContentBlock>,
         thread_channel: &ChannelRef,
+        trigger_msg: MessageRef,
+        authorized_user_ids: HashSet<String>,
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
         recipient: Option<(String, String)>,
@@ -165,8 +176,15 @@ impl DispatchTarget for AdapterRouter {
         self.bot_home_path()
     }
 
-    async fn ensure_session(&self, session_key: &str, working_dir: Option<&str>) -> Result<bool> {
-        self.pool().get_or_create(session_key, working_dir).await
+    async fn ensure_session(
+        &self,
+        session_key: &str,
+        working_dir: Option<&str>,
+        form_presenter: Option<Arc<dyn crate::acp::elicitation::FormPresenter>>,
+    ) -> Result<bool> {
+        self.pool()
+            .get_or_create(session_key, working_dir, form_presenter)
+            .await
     }
 
     async fn reset_session(&self, session_key: &str) {
@@ -179,6 +197,8 @@ impl DispatchTarget for AdapterRouter {
         session_key: &str,
         content_blocks: Vec<ContentBlock>,
         thread_channel: &ChannelRef,
+        trigger_msg: MessageRef,
+        authorized_user_ids: HashSet<String>,
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
         recipient: Option<(String, String)>,
@@ -189,6 +209,8 @@ impl DispatchTarget for AdapterRouter {
             session_key,
             content_blocks,
             thread_channel,
+            trigger_msg,
+            authorized_user_ids,
             reactions,
             other_bot_present,
             recipient,
@@ -648,6 +670,12 @@ async fn dispatch_batch(
     // batch attributes to the most recent sender; None for non-Slack/bot turns.
     let recipient: Option<(String, String)> = batch.last().and_then(|m| m.recipient.clone());
 
+    let authorized_user_ids: HashSet<String> = batch
+        .iter()
+        .filter(|m| !m.sender_is_bot)
+        .map(|m| m.sender_id.clone())
+        .collect();
+
     // Anchor reactions on the last message in the batch (before consuming).
     let trigger_msg = batch.last().unwrap().trigger_msg.clone();
     let dispatch_channel = ChannelRef {
@@ -695,7 +723,11 @@ async fn dispatch_batch(
     // Ensure session exists. The create_gate mutex inside get_or_create serializes
     // concurrent callers — only the winner gets created_now == true.
     let created_now = match target
-        .ensure_session(&session_key, workspace_override.as_deref())
+        .ensure_session(
+            &session_key,
+            workspace_override.as_deref(),
+            adapter.form_presenter(),
+        )
         .await
     {
         Ok(created) => created,
@@ -761,7 +793,7 @@ async fn dispatch_batch(
     let reactions = Arc::new(StatusReactionController::new(
         reactions_config.enabled,
         adapter.clone(),
-        trigger_msg,
+        trigger_msg.clone(),
         reactions_config.emojis.clone(),
         reactions_config.timing.clone(),
     ));
@@ -773,6 +805,8 @@ async fn dispatch_batch(
             &session_key,
             content_blocks,
             &dispatch_channel,
+            trigger_msg,
+            authorized_user_ids,
             reactions.clone(),
             other_bot_present,
             recipient,
@@ -1414,6 +1448,7 @@ mod tests {
             &self,
             _session_key: &str,
             _working_dir: Option<&str>,
+            _form_presenter: Option<Arc<dyn crate::acp::elicitation::FormPresenter>>,
         ) -> Result<bool> {
             if let Some(msg) = self.ensure_err.lock().unwrap().take() {
                 return Err(anyhow::anyhow!(msg));
@@ -1429,6 +1464,8 @@ mod tests {
             _session_key: &str,
             content_blocks: Vec<ContentBlock>,
             thread_channel: &ChannelRef,
+            _trigger_msg: MessageRef,
+            _authorized_user_ids: HashSet<String>,
             _reactions: Arc<StatusReactionController>,
             other_bot_present: bool,
             _recipient: Option<(String, String)>,
@@ -1501,6 +1538,8 @@ mod tests {
             sender_json: r#"{"schema":"openab.sender.v1","sender_id":"u","sender_name":"u"}"#
                 .into(),
             sender_name: "u".into(),
+            sender_id: "u".into(),
+            sender_is_bot: false,
             prompt: prompt.into(),
             extra_blocks: vec![],
             trigger_msg: MessageRef {

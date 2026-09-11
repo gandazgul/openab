@@ -1,17 +1,22 @@
+use crate::acp::elicitation::{
+    jsonrpc_error, jsonrpc_success, presentation_failure, validate_accepted_content,
+    ConnectionGeneration, ElicitationCoordinator, ElicitationOutcome, ElicitationStart,
+    ElicitationStatus, ElicitationTurnContext, FormPresenter, MAX_ACP_FRAME_BYTES,
+};
 use crate::acp::protocol::{
-    parse_config_options, parse_usage_report, ConfigOption, JsonRpcMessage, JsonRpcRequest,
-    JsonRpcResponse, UsageReport,
+    parse_config_options, parse_usage_report, ConfigOption, JsonRpcId, JsonRpcMessage,
+    JsonRpcRequest, JsonRpcResponse, UsageReport,
 };
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 /// Pick the most permissive selectable permission option from ACP options.
 fn pick_best_option(options: &[Value]) -> Option<String> {
@@ -187,6 +192,11 @@ pub struct AcpConnection {
     pub last_active: Instant,
     pub activity: Arc<SessionActivity>,
     pub session_reset: bool,
+    generation: ConnectionGeneration,
+    elicitation: Arc<ElicitationCoordinator>,
+    elicitation_turn: Arc<Mutex<Option<ElicitationTurnContext>>>,
+    form_presenter: Option<Arc<dyn FormPresenter>>,
+    agent_name_shared: Arc<Mutex<String>>,
     _reader_handle: JoinHandle<()>,
     _stderr_handle: Option<JoinHandle<()>>,
     /// Revokes this session's facade token when the connection is dropped, on any evict path.
@@ -230,36 +240,79 @@ fn build_agent_env(
 /// and forwards notifications + stale id-bearing messages to the active
 /// subscriber. Extracted as a free generic function so unit tests can drive
 /// it with `tokio::io::duplex()` halves instead of a real child process.
-pub(crate) async fn run_reader_loop<R, W>(
-    reader: R,
+pub(crate) struct ReaderLoopContext<W> {
     writer: Arc<Mutex<W>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
     notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
-) where
+    elicitation: Arc<ElicitationCoordinator>,
+    generation: ConnectionGeneration,
+    elicitation_turn: Arc<Mutex<Option<ElicitationTurnContext>>>,
+    form_presenter: Option<Arc<dyn FormPresenter>>,
+    agent_name: Arc<Mutex<String>>,
+}
+
+pub(crate) async fn run_reader_loop<R, W>(reader: R, ctx: ReaderLoopContext<W>)
+where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let ReaderLoopContext {
+        writer,
+        pending,
+        notify_tx,
+        elicitation,
+        generation,
+        elicitation_turn,
+        form_presenter,
+        agent_name,
+    } = ctx;
     let mut reader = BufReader::new(reader);
-    let mut line = String::new();
+    let mut line = Vec::new();
     loop {
         line.clear();
-        match reader.read_line(&mut line).await {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
-            Err(e) => {
-                error!("reader error: {e}");
-                break;
+        let mut close_reader = false;
+        loop {
+            let mut byte = [0u8; 1];
+            match reader.read(&mut byte).await {
+                Ok(0) if line.is_empty() => break,
+                Ok(0) => break,
+                Ok(_) => {
+                    if line.len() >= MAX_ACP_FRAME_BYTES {
+                        error!(
+                            limit = MAX_ACP_FRAME_BYTES,
+                            "ACP frame exceeded maximum size"
+                        );
+                        close_reader = true;
+                        break;
+                    }
+                    line.push(byte[0]);
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!("reader error: {e}");
+                    close_reader = true;
+                    break;
+                }
             }
         }
-        let msg: JsonRpcMessage = match serde_json::from_str(line.trim()) {
+        if close_reader || line.is_empty() {
+            break;
+        }
+        let raw = match std::str::from_utf8(&line) {
+            Ok(raw) => raw.trim_end_matches(['\r', '\n']),
+            Err(_) => continue,
+        };
+        let msg: JsonRpcMessage = match serde_json::from_str(raw) {
             Ok(m) => m,
             Err(_) => continue,
         };
-        debug!(line = line.trim(), "acp_recv");
+        debug!(method = ?msg.method, has_id = msg.id.is_some(), "acp_recv");
 
-        // Auto-reply session/request_permission
-        if msg.method.as_deref() == Some("session/request_permission") {
-            if let Some(id) = msg.id {
+        // Agent-to-client requests must be classified before outbound response matching.
+        if let (Some(method), Some(agent_request_id)) = (msg.method.as_deref(), msg.id.clone()) {
+            if method == "session/request_permission" {
                 let title = msg
                     .params
                     .as_ref()
@@ -270,18 +323,141 @@ pub(crate) async fn run_reader_loop<R, W>(
 
                 let outcome = build_permission_response(msg.params.as_ref());
                 info!(title, %outcome, "auto-respond permission");
-                let reply = JsonRpcResponse::new(id, outcome);
+                let reply = JsonRpcResponse::new(agent_request_id, outcome);
                 if let Ok(data) = serde_json::to_string(&reply) {
-                    let mut w = writer.lock().await;
-                    let _ = w.write_all(format!("{data}\n").as_bytes()).await;
-                    let _ = w.flush().await;
+                    let _ = write_json_line(writer.clone(), data).await;
                 }
+                continue;
+            }
+
+            if method == "elicitation/create" {
+                let Some(params) = msg.params.as_ref() else {
+                    let err = crate::acp::elicitation::ElicitationError::invalid_params(
+                        "elicitation/create params are required",
+                    );
+                    if let Ok(data) = serde_json::to_string(&jsonrpc_error(agent_request_id, err)) {
+                        let _ = write_json_line(writer.clone(), data).await;
+                    }
+                    continue;
+                };
+                let Some(presenter) = form_presenter.clone() else {
+                    let err = crate::acp::elicitation::ElicitationError::invalid_params(
+                        "form elicitation is not supported for this session",
+                    );
+                    if let Ok(data) = serde_json::to_string(&jsonrpc_error(agent_request_id, err)) {
+                        let _ = write_json_line(writer.clone(), data).await;
+                    }
+                    continue;
+                };
+                let turn = elicitation_turn.lock().await.clone();
+                let display_agent_name = agent_name.lock().await.clone();
+                match elicitation
+                    .start(
+                        generation,
+                        agent_request_id.clone(),
+                        params,
+                        raw.len(),
+                        turn.as_ref(),
+                        &display_agent_name,
+                    )
+                    .await
+                {
+                    ElicitationStart::Immediate(outcome) => {
+                        if let Ok(data) = serde_json::to_string(&jsonrpc_success(
+                            agent_request_id,
+                            outcome.to_result_value(),
+                        )) {
+                            let _ = write_json_line(writer.clone(), data).await;
+                        }
+                    }
+                    ElicitationStart::Error(err) => {
+                        if let Ok(data) =
+                            serde_json::to_string(&jsonrpc_error(agent_request_id, err))
+                        {
+                            let _ = write_json_line(writer.clone(), data).await;
+                        }
+                    }
+                    ElicitationStart::Present(lease) => {
+                        let writer = writer.clone();
+                        let elicitation = elicitation.clone();
+                        tokio::spawn(async move {
+                            let (presentation, receiver) = lease.into_parts();
+                            let id = presentation.agent_request_id.clone();
+                            let generation = presentation.generation;
+                            let nonce = presentation.nonce.clone();
+                            let form = presentation.form.clone();
+                            let outcome = tokio::select! {
+                                result = presenter.present_form(presentation) => {
+                                    match result
+                                        .map_err(presentation_failure)
+                                        .and_then(|outcome| validate_accepted_content(&form, outcome))
+                                    {
+                                        Ok(outcome) => {
+                                            if !elicitation.complete_generation(generation).await {
+                                                let _ = presenter.expire_form(&nonce, ElicitationStatus::Expired).await;
+                                                return;
+                                            }
+                                            Ok(outcome)
+                                        }
+                                        Err(err) => {
+                                            if !elicitation.complete_generation(generation).await {
+                                                let _ = presenter.expire_form(&nonce, ElicitationStatus::Expired).await;
+                                                return;
+                                            }
+                                            Err(err)
+                                        }
+                                    }
+                                }
+                                outcome = async { receiver.await.unwrap_or(ElicitationOutcome::Cancel) } => {
+                                    validate_accepted_content(&form, outcome)
+                                }
+                            };
+                            let status = match &outcome {
+                                Ok(ElicitationOutcome::Accept(_)) => ElicitationStatus::Submitted,
+                                Ok(ElicitationOutcome::Decline) => ElicitationStatus::Declined,
+                                Ok(ElicitationOutcome::Cancel) => ElicitationStatus::Cancelled,
+                                Err(_) => ElicitationStatus::Expired,
+                            };
+                            let envelope = match outcome {
+                                Ok(outcome) => jsonrpc_success(id, outcome.to_result_value()),
+                                Err(err) => jsonrpc_error(id, err),
+                            };
+                            let delivered = if let Ok(data) = serde_json::to_string(&envelope) {
+                                write_json_line(writer, data).await.is_ok()
+                            } else {
+                                false
+                            };
+                            if !delivered {
+                                warn!("failed to write elicitation response; expiring generation");
+                                elicitation
+                                    .expire_generation(generation, ElicitationOutcome::Cancel)
+                                    .await;
+                            }
+                            let _ = presenter.expire_form(&nonce, status).await;
+                            elicitation.finish_generation(generation).await;
+                        });
+                    }
+                }
+                continue;
+            }
+
+            let err = crate::acp::protocol::JsonRpcError {
+                code: -32601,
+                message: format!("unsupported agent request method `{method}`"),
+                data: None,
+            };
+            if let Ok(data) = serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": agent_request_id,
+                "error": {"code": err.code, "message": err.message},
+            })) {
+                let _ = write_json_line(writer.clone(), data).await;
             }
             continue;
         }
 
-        // Response (has id) → resolve pending AND forward to subscriber
-        if let Some(id) = msg.id {
+        // Response (numeric id) → resolve pending AND forward to subscriber.
+        if let Some(id) = msg.id.as_ref().and_then(JsonRpcId::as_u64) {
             let mut map = pending.lock().await;
             if let Some(tx) = map.remove(&id) {
                 // Forward to subscriber so they see the completion
@@ -289,7 +465,7 @@ pub(crate) async fn run_reader_loop<R, W>(
                 if let Some(ntx) = sub.as_ref() {
                     // Clone the essential fields for the subscriber
                     let _ = ntx.send(JsonRpcMessage {
-                        id: Some(id),
+                        id: Some(JsonRpcId::Number(id as i64)),
                         method: None,
                         result: msg.result.clone(),
                         error: msg.error.clone(),
@@ -312,6 +488,10 @@ pub(crate) async fn run_reader_loop<R, W>(
         }
     }
 
+    elicitation
+        .expire_generation(generation, ElicitationOutcome::Cancel)
+        .await;
+
     // Connection closed — resolve all pending with error
     let mut map = pending.lock().await;
     for (_, tx) in map.drain() {
@@ -332,6 +512,16 @@ pub(crate) async fn run_reader_loop<R, W>(
     *sub = None;
 }
 
+async fn write_json_line<W>(writer: Arc<Mutex<W>>, data: String) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut w = writer.lock().await;
+    w.write_all(data.as_bytes()).await?;
+    w.write_all(b"\n").await?;
+    w.flush().await
+}
+
 impl AcpConnection {
     pub async fn spawn(
         command: &str,
@@ -339,6 +529,17 @@ impl AcpConnection {
         working_dir: &str,
         env: &std::collections::HashMap<String, String>,
         inherit_env: &[String],
+    ) -> Result<Self> {
+        Self::spawn_with_elicitation(command, args, working_dir, env, inherit_env, None).await
+    }
+
+    pub async fn spawn_with_elicitation(
+        command: &str,
+        args: &[String],
+        working_dir: &str,
+        env: &std::collections::HashMap<String, String>,
+        inherit_env: &[String],
+        form_presenter: Option<Arc<dyn FormPresenter>>,
     ) -> Result<Self> {
         info!(cmd = command, ?args, cwd = working_dir, "spawning agent");
 
@@ -467,12 +668,23 @@ impl AcpConnection {
             Arc::new(Mutex::new(HashMap::new()));
         let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(None));
+        let elicitation = ElicitationCoordinator::new();
+        let generation = ConnectionGeneration::new();
+        let elicitation_turn = Arc::new(Mutex::new(None));
+        let agent_name_shared = Arc::new(Mutex::new(command.to_string()));
 
         let reader_handle = tokio::spawn(run_reader_loop(
             stdout,
-            stdin.clone(),
-            pending.clone(),
-            notify_tx.clone(),
+            ReaderLoopContext {
+                writer: stdin.clone(),
+                pending: pending.clone(),
+                notify_tx: notify_tx.clone(),
+                elicitation: elicitation.clone(),
+                generation,
+                elicitation_turn: elicitation_turn.clone(),
+                form_presenter: form_presenter.clone(),
+                agent_name: agent_name_shared.clone(),
+            },
         ));
 
         let activity = Arc::new(SessionActivity::new());
@@ -486,11 +698,16 @@ impl AcpConnection {
             notify_tx,
             acp_session_id: None,
             supports_load_session: false,
-            agent_name: String::new(),
+            agent_name: command.to_string(),
             config_options: Vec::new(),
             last_active: Instant::now(),
             activity,
             session_reset: false,
+            generation,
+            elicitation,
+            elicitation_turn,
+            form_presenter,
+            agent_name_shared,
             _reader_handle: reader_handle,
             _stderr_handle: stderr_handle,
             #[cfg(feature = "acp-mcp")]
@@ -547,12 +764,17 @@ impl AcpConnection {
     }
 
     pub async fn initialize(&mut self) -> Result<()> {
+        let client_capabilities = if self.form_presenter.is_some() {
+            json!({"elicitation": {"form": {}}})
+        } else {
+            json!({})
+        };
         let resp = self
             .send_request(
                 "initialize",
                 Some(json!({
                     "protocolVersion": 1,
-                    "clientCapabilities": {},
+                    "clientCapabilities": client_capabilities,
                     "clientInfo": {"name": "openab", "version": "0.1.0"},
                 })),
             )
@@ -563,15 +785,17 @@ impl AcpConnection {
             .and_then(|r| r.get("agentInfo"))
             .and_then(|a| a.get("name"))
             .and_then(|n| n.as_str())
-            .unwrap_or("unknown");
-        self.agent_name = agent_name.to_string();
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| self.agent_name.clone());
+        self.agent_name = agent_name.clone();
+        *self.agent_name_shared.lock().await = self.agent_name.clone();
         self.supports_load_session = result
             .and_then(|r| r.get("agentCapabilities"))
             .and_then(|c| c.get("loadSession"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         info!(
-            agent = agent_name,
+            agent = %agent_name,
             load_session = self.supports_load_session,
             "initialized"
         );
@@ -707,9 +931,28 @@ impl AcpConnection {
     /// Send a prompt with content blocks (text and/or images) and return a receiver
     /// for streaming notifications. The final message on the channel will have id set
     /// (the prompt response).
+    pub async fn set_elicitation_turn(&self, context: Option<ElicitationTurnContext>) {
+        *self.elicitation_turn.lock().await = context;
+    }
+
+    pub fn generation(&self) -> ConnectionGeneration {
+        self.generation
+    }
+
+    pub async fn pending_elicitations(&self) -> usize {
+        self.elicitation.active_count().await
+    }
+
+    pub fn elicitation_handle(&self) -> (Arc<ElicitationCoordinator>, ConnectionGeneration) {
+        (self.elicitation.clone(), self.generation)
+    }
+
     pub async fn session_prompt(
         &mut self,
         content_blocks: Vec<ContentBlock>,
+        turn_channel: crate::adapter::ChannelRef,
+        trigger_message: crate::adapter::MessageRef,
+        authorized_user_ids: HashSet<String>,
     ) -> Result<(mpsc::UnboundedReceiver<JsonRpcMessage>, u64)> {
         self.last_active = Instant::now();
         self.activity.touch();
@@ -724,6 +967,13 @@ impl AcpConnection {
         *self.notify_tx.lock().await = Some(tx);
 
         let id = self.next_id();
+        *self.elicitation_turn.lock().await = Some(ElicitationTurnContext {
+            session_id: self.acp_session_id.clone(),
+            request_id: Some(id),
+            channel: turn_channel,
+            trigger_message,
+            authorized_user_ids,
+        });
 
         // Convert content blocks to JSON
         let prompt_json: Vec<Value> = content_blocks.iter().map(|b| b.to_json()).collect();
@@ -741,12 +991,25 @@ impl AcpConnection {
         let (resp_tx, _resp_rx) = oneshot::channel();
         self.pending.lock().await.insert(id, resp_tx);
 
-        self.send_raw(&data).await?;
+        if let Err(err) = self.send_raw(&data).await {
+            self.pending.lock().await.remove(&id);
+            self.elicitation
+                .expire_generation(self.generation, ElicitationOutcome::Cancel)
+                .await;
+            *self.elicitation_turn.lock().await = None;
+            *self.notify_tx.lock().await = None;
+            self.activity.set_in_flight(false);
+            return Err(err);
+        }
         Ok((rx, id))
     }
 
     /// Call after prompt streaming is done to clean up subscriber.
     pub async fn prompt_done(&mut self) {
+        self.elicitation
+            .expire_generation(self.generation, ElicitationOutcome::Cancel)
+            .await;
+        *self.elicitation_turn.lock().await = None;
         *self.notify_tx.lock().await = None;
         self.activity.touch();
         self.activity.set_in_flight(false);
@@ -759,6 +1022,9 @@ impl AcpConnection {
     /// already be dead, in which case the stdin write fails harmlessly.
     /// See #732.
     pub async fn abandon_request(&self, request_id: u64) {
+        self.elicitation
+            .expire_generation(self.generation, ElicitationOutcome::Cancel)
+            .await;
         self.pending.lock().await.remove(&request_id);
         let Some(session_id) = self.acp_session_id.as_deref() else {
             return;
@@ -846,6 +1112,13 @@ impl Drop for AcpConnection {
         if let Some(handle) = self._stderr_handle.take() {
             handle.abort();
         }
+        let coordinator = self.elicitation.clone();
+        let generation = self.generation;
+        tokio::spawn(async move {
+            coordinator
+                .expire_generation(generation, ElicitationOutcome::Cancel)
+                .await;
+        });
         self.kill_process_group();
     }
 }
@@ -995,6 +1268,23 @@ mod reader_loop_tests {
     use tokio::io::{duplex, AsyncWriteExt};
     use tokio::sync::{mpsc, oneshot, Mutex};
 
+    fn test_reader_context<W>(
+        writer: Arc<Mutex<W>>,
+        pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
+        notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
+    ) -> ReaderLoopContext<W> {
+        ReaderLoopContext {
+            writer,
+            pending,
+            notify_tx,
+            elicitation: ElicitationCoordinator::new(),
+            generation: ConnectionGeneration::new(),
+            elicitation_turn: Arc::new(Mutex::new(None)),
+            form_presenter: None,
+            agent_name: Arc::new(Mutex::new(String::new())),
+        }
+    }
+
     /// #732 stale-id path: when a response arrives for an id the broker has
     /// already abandoned, the reader must (a) not crash, (b) leave `pending`
     /// untouched, and (c) still forward the message to whoever is currently
@@ -1016,9 +1306,7 @@ mod reader_loop_tests {
         let writer = Arc::new(Mutex::new(agent_stdin_writer));
         let handle = tokio::spawn(run_reader_loop(
             agent_stdout_reader,
-            writer,
-            pending.clone(),
-            notify_tx.clone(),
+            test_reader_context(writer, pending.clone(), notify_tx.clone()),
         ));
 
         let stale = b"{\"jsonrpc\":\"2.0\",\"id\":42,\"result\":{\"stopReason\":\"ok\"}}\n";
@@ -1029,7 +1317,7 @@ mod reader_loop_tests {
             .await
             .expect("subscriber should receive stale message before timeout")
             .expect("subscriber channel should not be closed");
-        assert_eq!(forwarded.id, Some(42));
+        assert_eq!(forwarded.id, Some(JsonRpcId::Number(42)));
         assert!(pending.lock().await.is_empty());
 
         drop(agent_stdout_writer);
@@ -1059,9 +1347,7 @@ mod reader_loop_tests {
         let writer = Arc::new(Mutex::new(agent_stdin_writer));
         let handle = tokio::spawn(run_reader_loop(
             agent_stdout_reader,
-            writer,
-            pending.clone(),
-            notify_tx.clone(),
+            test_reader_context(writer, pending.clone(), notify_tx.clone()),
         ));
 
         let payload = b"{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"stopReason\":\"end_turn\"}}\n";
@@ -1072,16 +1358,54 @@ mod reader_loop_tests {
             .await
             .expect("oneshot should resolve")
             .expect("oneshot should not be cancelled");
-        assert_eq!(resolved.id, Some(7));
+        assert_eq!(resolved.id, Some(JsonRpcId::Number(7)));
 
         let forwarded = tokio::time::timeout(std::time::Duration::from_secs(2), sub_rx.recv())
             .await
             .expect("subscriber should receive forwarded copy")
             .expect("subscriber channel should not be closed");
-        assert_eq!(forwarded.id, Some(7));
+        assert_eq!(forwarded.id, Some(JsonRpcId::Number(7)));
         assert!(pending.lock().await.is_empty());
 
         drop(agent_stdout_writer);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn over_limit_frame_closes_reader_and_resolves_pending() {
+        let (mut agent_stdout_writer, agent_stdout_reader) = duplex(MAX_ACP_FRAME_BYTES + 32);
+        let (agent_stdin_writer, _agent_stdin_reader) = duplex(8 * 1024);
+
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (resp_tx, resp_rx) = oneshot::channel();
+        pending.lock().await.insert(7, resp_tx);
+        let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(None));
+
+        let handle = tokio::spawn(run_reader_loop(
+            agent_stdout_reader,
+            test_reader_context(
+                Arc::new(Mutex::new(agent_stdin_writer)),
+                pending.clone(),
+                notify_tx,
+            ),
+        ));
+
+        let payload = vec![b'a'; MAX_ACP_FRAME_BYTES + 1];
+        agent_stdout_writer.write_all(&payload).await.unwrap();
+        agent_stdout_writer.write_all(b"\n").await.unwrap();
+        agent_stdout_writer.flush().await.unwrap();
+
+        let resolved = tokio::time::timeout(std::time::Duration::from_secs(2), resp_rx)
+            .await
+            .expect("pending response should resolve after over-limit frame")
+            .expect("pending channel should not be dropped");
+        assert_eq!(
+            resolved.error.as_ref().map(|e| e.message.as_str()),
+            Some("connection closed")
+        );
+        assert!(pending.lock().await.is_empty());
         handle.await.unwrap();
     }
 

@@ -1,3 +1,7 @@
+use crate::acp::elicitation::{
+    ElicitationOutcome, ElicitationPresentation, ElicitationStatus, ElicitationStyle,
+    FormFieldKind, FormPresenter,
+};
 use crate::acp::protocol::{ConfigOption, UsageReport};
 use crate::acp::ContentBlock;
 use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
@@ -9,22 +13,29 @@ use crate::media;
 use crate::remind::{self, ReminderStore};
 use crate::trust::l3_gate_applies;
 use async_trait::async_trait;
+use serde_json::{Map, Value};
 use serenity::builder::{
-    CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateCommandOption,
-    CreateEmbed, CreateEmbedFooter, CreateInteractionResponse, CreateInteractionResponseFollowup,
-    CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind,
-    CreateSelectMenuOption, CreateThread, EditChannel, EditMessage, GetMessages,
+    CreateActionRow, CreateAllowedMentions, CreateAttachment, CreateButton, CreateCommand,
+    CreateCommandOption, CreateEmbed, CreateEmbedFooter, CreateInputText,
+    CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
+    CreateMessage, CreateModal, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption,
+    CreateThread, EditChannel, EditMessage, GetMessages,
 };
 use serenity::http::Http;
-use serenity::model::application::ButtonStyle;
-use serenity::model::application::{Command, CommandOptionType, ComponentInteractionDataKind, Interaction};
-use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, Reaction, ReactionType};
+use serenity::model::application::{ActionRowComponent, ButtonStyle, InputTextStyle};
+use serenity::model::application::{
+    Command, CommandOptionType, ComponentInteractionDataKind, Interaction,
+};
+use serenity::model::channel::{
+    AutoArchiveDuration, Message, MessageFlags, MessageType, Reaction, ReactionType,
+};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use std::sync::{Arc, OnceLock};
+use tokio::sync::{oneshot, Mutex as TokioMutex};
 use tracing::{debug, error, info, warn};
 
 /// Hard cap on consecutive bot messages in a channel or thread.
@@ -60,15 +71,857 @@ fn truncate_for_discord(s: &str, max: usize) -> String {
 /// Avoid unbounded Discord history exports from very large threads.
 const THREAD_EXPORT_MESSAGE_LIMIT: usize = 5000;
 
+fn no_mentions() -> CreateAllowedMentions {
+    CreateAllowedMentions::new()
+        .everyone(false)
+        .all_users(false)
+        .all_roles(false)
+        .replied_user(false)
+}
+
+#[derive(Debug)]
+struct DiscordElicitationState {
+    presentation: ElicitationPresentation,
+    message_id: String,
+    current_field: usize,
+    display_page: usize,
+    validation_error: Option<String>,
+    values: Map<String, Value>,
+    outcome_tx: Option<oneshot::Sender<ElicitationOutcome>>,
+}
+
+#[derive(Debug)]
+pub struct DiscordElicitationRegistry {
+    http: Arc<Http>,
+    states: TokioMutex<HashMap<String, DiscordElicitationState>>,
+    completed_messages: TokioMutex<HashSet<String>>,
+}
+
+impl DiscordElicitationRegistry {
+    pub fn new(http: Arc<Http>) -> Arc<Self> {
+        Arc::new(Self {
+            http,
+            states: TokioMutex::new(HashMap::new()),
+            completed_messages: TokioMutex::new(HashSet::new()),
+        })
+    }
+
+    async fn set_message_id(&self, nonce: &str, message_id: String) -> bool {
+        if let Some(state) = self.states.lock().await.get_mut(nonce) {
+            state.message_id = message_id;
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn handle_text_reply(
+        &self,
+        http: &Arc<Http>,
+        channel_id: ChannelId,
+        author_id: UserId,
+        reply_to: Option<MessageId>,
+        content: &str,
+    ) -> bool {
+        let reply_to = match reply_to {
+            Some(id) => id.to_string(),
+            None => return false,
+        };
+        if self.completed_messages.lock().await.contains(&reply_to) {
+            return true;
+        }
+
+        let mut states = self.states.lock().await;
+        let Some((nonce, state)) = states.iter_mut().find(|(_, state)| {
+            state.message_id == reply_to
+                && state.presentation.channel.channel_id == channel_id.to_string()
+        }) else {
+            return false;
+        };
+        if state.outcome_tx.is_none()
+            || !state
+                .presentation
+                .authorized_user_ids
+                .contains(&author_id.to_string())
+        {
+            return true;
+        }
+
+        let nonce = nonce.clone();
+        let author = author_id.to_string();
+        let channel = state.presentation.channel.clone();
+        let message_id: u64 = match state.message_id.parse() {
+            Ok(id) => id,
+            Err(_) => return true,
+        };
+        let terminal = apply_text_reply(state, content);
+        let page = render_elicitation_content(state, None);
+        let components = render_elicitation_components(state, false);
+        drop(states);
+
+        match terminal {
+            Some(outcome) => {
+                let _ = self
+                    .complete(&nonce, &author, &channel, Some(&reply_to), outcome)
+                    .await;
+            }
+            None => {
+                let _ = ChannelId::new(channel_id.get())
+                    .edit_message(
+                        http,
+                        MessageId::new(message_id),
+                        EditMessage::new()
+                            .content(page)
+                            .allowed_mentions(no_mentions())
+                            .suppress_embeds(true)
+                            .components(components),
+                    )
+                    .await;
+                tracing::debug!(nonce, "accepted elicitation text fallback reply");
+            }
+        }
+        true
+    }
+
+    async fn complete(
+        &self,
+        nonce: &str,
+        user_id: &str,
+        channel: &ChannelRef,
+        reply_to_message_id: Option<&str>,
+        outcome: ElicitationOutcome,
+    ) -> bool {
+        let (coordinator, generation) = {
+            let states = self.states.lock().await;
+            let Some(state) = states.get(nonce) else {
+                return false;
+            };
+            if state.outcome_tx.is_none() {
+                return false;
+            }
+            (
+                state.presentation.coordinator.clone(),
+                state.presentation.generation,
+            )
+        };
+        let resolved = coordinator
+            .resolve(
+                generation,
+                nonce,
+                user_id,
+                channel,
+                reply_to_message_id,
+                outcome,
+            )
+            .await
+            .is_ok();
+        if resolved {
+            if let Some(state) = self.states.lock().await.get_mut(nonce) {
+                state.outcome_tx = None;
+            }
+        }
+        resolved
+    }
+}
+
+#[async_trait]
+impl FormPresenter for DiscordElicitationRegistry {
+    async fn present_form(
+        &self,
+        presentation: ElicitationPresentation,
+    ) -> anyhow::Result<ElicitationOutcome> {
+        let (outcome_tx, outcome_rx) = oneshot::channel();
+        let nonce = presentation.nonce.clone();
+        let channel_id: u64 = presentation.channel.channel_id.parse()?;
+        let values = presentation.form.default_content();
+        {
+            let mut states = self.states.lock().await;
+            states.insert(
+                nonce.clone(),
+                DiscordElicitationState {
+                    presentation,
+                    message_id: String::new(),
+                    current_field: 0,
+                    display_page: 0,
+                    validation_error: None,
+                    values,
+                    outcome_tx: Some(outcome_tx),
+                },
+            );
+        }
+        let (content, components) = {
+            let states = self.states.lock().await;
+            let state = states
+                .get(&nonce)
+                .ok_or_else(|| anyhow::anyhow!("elicitation state missing"))?;
+            (
+                render_elicitation_content(state, None),
+                render_elicitation_components(state, false),
+            )
+        };
+        let mut sent = ChannelId::new(channel_id)
+            .send_message(
+                &self.http,
+                CreateMessage::new()
+                    .content(content)
+                    .allowed_mentions(no_mentions())
+                    .flags(MessageFlags::SUPPRESS_EMBEDS)
+                    .components(components),
+            )
+            .await;
+        if sent.is_err() {
+            {
+                let mut states = self.states.lock().await;
+                if let Some(state) = states.get_mut(&nonce) {
+                    state.presentation.style = ElicitationStyle::TextFallback;
+                }
+            }
+            let (content, components) = {
+                let states = self.states.lock().await;
+                let state = states
+                    .get(&nonce)
+                    .ok_or_else(|| anyhow::anyhow!("elicitation state missing"))?;
+                (
+                    render_elicitation_content(state, None),
+                    render_elicitation_components(state, false),
+                )
+            };
+            sent = ChannelId::new(channel_id)
+                .send_message(
+                    &self.http,
+                    CreateMessage::new()
+                        .content(content)
+                        .allowed_mentions(no_mentions())
+                        .flags(MessageFlags::SUPPRESS_EMBEDS)
+                        .components(components),
+                )
+                .await;
+        }
+        let msg = match sent {
+            Ok(msg) => msg,
+            Err(e) => {
+                self.states.lock().await.remove(&nonce);
+                return Err(e.into());
+            }
+        };
+        if !self.set_message_id(&nonce, msg.id.to_string()).await {
+            let _ = ChannelId::new(channel_id)
+                .edit_message(
+                    &self.http,
+                    msg.id,
+                    EditMessage::new()
+                        .content("This form expired before it was ready.")
+                        .allowed_mentions(no_mentions())
+                        .suppress_embeds(true)
+                        .components(vec![]),
+                )
+                .await;
+            return Err(anyhow::anyhow!(
+                "elicitation expired before presentation completed"
+            ));
+        }
+        outcome_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("elicitation was cancelled"))
+    }
+
+    async fn expire_form(&self, nonce: &str, status: ElicitationStatus) {
+        let mut states = self.states.lock().await;
+        let Some(state) = states.remove(nonce) else {
+            return;
+        };
+        if !state.message_id.is_empty() {
+            self.completed_messages
+                .lock()
+                .await
+                .insert(state.message_id.clone());
+        }
+        let Ok(channel_id) = state.presentation.channel.channel_id.parse::<u64>() else {
+            return;
+        };
+        let Ok(message_id) = state.message_id.parse::<u64>() else {
+            return;
+        };
+        drop(states);
+        let status_text = match status {
+            ElicitationStatus::Submitted => "Submitted",
+            ElicitationStatus::Declined => "Declined",
+            ElicitationStatus::Cancelled => "Cancelled",
+            ElicitationStatus::Expired => "Expired",
+        };
+        let content = format!(
+            "{}\n\n**Status:** {status_text}",
+            render_resolved_summary(&state)
+        );
+        let _ = ChannelId::new(channel_id)
+            .edit_message(
+                &self.http,
+                MessageId::new(message_id),
+                EditMessage::new()
+                    .content(truncate_for_discord(&content, 1900))
+                    .allowed_mentions(no_mentions())
+                    .suppress_embeds(true)
+                    .components(vec![]),
+            )
+            .await;
+    }
+}
+
+fn render_resolved_summary(state: &DiscordElicitationState) -> String {
+    format!(
+        "**{} requested information**\n\nValues are not shown after terminal resolution.",
+        neutralize_agent_text(&state.presentation.agent_name),
+    )
+}
+
+fn page_text(full: &str, page: usize) -> String {
+    const PAGE_BUDGET: usize = 1750;
+    let chunks = split_display_pages(full, PAGE_BUDGET);
+    let total = chunks.len().max(1);
+    let page = page.min(total - 1);
+    let mut out = chunks.get(page).cloned().unwrap_or_default();
+    if total > 1 {
+        out.push_str(&format!(
+            "\n\n_Page {}/{} — use Prev/Next or reply `!form prev` / `!form next`._",
+            page + 1,
+            total
+        ));
+    }
+    out
+}
+
+fn split_display_pages(text: &str, budget: usize) -> Vec<String> {
+    if text.chars().count() <= budget {
+        return vec![text.to_string()];
+    }
+    let mut pages = Vec::new();
+    let mut current = String::new();
+    for line in text.split_inclusive('\n') {
+        let line_len = line.chars().count();
+        if !current.is_empty() && current.chars().count() + line_len > budget {
+            pages.push(current);
+            current = String::new();
+        }
+        if line_len <= budget {
+            current.push_str(line);
+            continue;
+        }
+        let mut part = String::new();
+        for ch in line.chars() {
+            if part.chars().count() >= budget {
+                if !current.is_empty() {
+                    pages.push(current);
+                    current = String::new();
+                }
+                pages.push(part);
+                part = String::new();
+            }
+            part.push(ch);
+        }
+        current.push_str(&part);
+    }
+    if !current.is_empty() || pages.is_empty() {
+        pages.push(current);
+    }
+    pages
+}
+
+fn current_full_elicitation_content(
+    state: &DiscordElicitationState,
+    error: Option<&str>,
+) -> String {
+    let mut body = format!(
+        "**{} requested information**\n\n{}\n\n⚠️ Do not enter passwords, API keys, tokens, private keys, recovery codes, payment credentials, or other secrets.",
+        neutralize_agent_text(&state.presentation.agent_name),
+        neutralize_agent_text(&state.presentation.message),
+    );
+    if state.current_field >= state.presentation.form.fields.len() {
+        body.push_str("\n\n**Review values**");
+        for (index, field) in state.presentation.form.fields.iter().enumerate() {
+            let shown = state
+                .values
+                .get(&field.name)
+                .or(field.default.as_ref())
+                .map(display_value)
+                .unwrap_or_else(|| "(omitted)".to_string());
+            body.push_str(&format!(
+                "\n{}. {}: `{}`",
+                index + 1,
+                neutralize_agent_text(field.display_name()),
+                neutralize_agent_text(&shown),
+            ));
+        }
+        body.push_str("\n\nReply `!form submit`, `!form decline`, `!form cancel`, or `!form edit N` to change a field.");
+    } else {
+        let field = &state.presentation.form.fields[state.current_field];
+        body.push_str(&format!(
+            "\n\n**Field {}/{}: {}**",
+            state.current_field + 1,
+            state.presentation.form.fields.len(),
+            neutralize_agent_text(field.display_name()),
+        ));
+        if let Some(desc) = &field.description {
+            body.push_str(&format!("\n{}", neutralize_agent_text(desc)));
+        }
+        if let Some(default) = &field.default {
+            body.push_str(&format!(
+                "\nDefault: `{}`",
+                neutralize_agent_text(&display_value(default))
+            ));
+        }
+        if let Some(value) = state.values.get(&field.name) {
+            body.push_str(&format!(
+                "\nCurrent: `{}`",
+                neutralize_agent_text(&display_value(value))
+            ));
+        }
+        body.push_str("\n\nReply directly to this message with the value. Commands: `!form next`, `!form prev`, `!form review`, `!form edit N`, `!form skip`, `!form submit`, `!form decline`, `!form cancel`, `!form value <JSON value>`, `!form choose N [M ...]`.");
+        if let FormFieldKind::SingleSelect { choices }
+        | FormFieldKind::MultiSelect { choices, .. } = &field.kind
+        {
+            body.push_str("\n\nChoices:");
+            for (index, choice) in choices.iter().enumerate() {
+                let label = choice.label.as_deref().unwrap_or(&choice.value);
+                body.push_str(&format!(
+                    "\n{}. {} = `{}`",
+                    index + 1,
+                    neutralize_agent_text(label),
+                    neutralize_agent_text(&choice.value),
+                ));
+                if let Some(desc) = &choice.description {
+                    body.push_str(&format!(" — {}", neutralize_agent_text(desc)));
+                }
+            }
+        }
+    }
+    let err = error.or(state.validation_error.as_deref());
+    if let Some(error) = err {
+        body.push_str(&format!("\n\n❌ {}", neutralize_agent_text(error)));
+    }
+    body
+}
+
+fn render_elicitation_content(state: &DiscordElicitationState, error: Option<&str>) -> String {
+    let full = current_full_elicitation_content(state, error);
+    page_text(&full, state.display_page)
+}
+
+fn render_elicitation_components(
+    state: &DiscordElicitationState,
+    disabled: bool,
+) -> Vec<CreateActionRow> {
+    let nonce = &state.presentation.nonce;
+    let full = current_full_elicitation_content(state, None);
+    let total_pages = split_display_pages(&full, 1750).len();
+    let mut rows = Vec::new();
+    if total_pages > 1 {
+        rows.push(CreateActionRow::Buttons(vec![
+            CreateButton::new(format!("acp_elicit:{nonce}:prev"))
+                .label("Prev")
+                .style(ButtonStyle::Secondary)
+                .disabled(disabled || state.display_page == 0),
+            CreateButton::new(format!("acp_elicit:{nonce}:next"))
+                .label("Next")
+                .style(ButtonStyle::Secondary)
+                .disabled(disabled || state.display_page + 1 >= total_pages),
+        ]));
+    }
+    if state.current_field >= state.presentation.form.fields.len() {
+        rows.push(CreateActionRow::Buttons(vec![
+            CreateButton::new(format!("acp_elicit:{nonce}:modify:0"))
+                .label("Modify")
+                .style(ButtonStyle::Secondary)
+                .disabled(disabled || state.presentation.form.fields.is_empty()),
+            CreateButton::new(format!("acp_elicit:{nonce}:submit"))
+                .label("Submit")
+                .style(ButtonStyle::Success)
+                .disabled(disabled),
+            CreateButton::new(format!("acp_elicit:{nonce}:decline"))
+                .label("Decline")
+                .style(ButtonStyle::Danger)
+                .disabled(disabled),
+            CreateButton::new(format!("acp_elicit:{nonce}:cancel"))
+                .label("Cancel")
+                .style(ButtonStyle::Secondary)
+                .disabled(disabled),
+        ]));
+        return rows;
+    }
+
+    let field = &state.presentation.form.fields[state.current_field];
+    if !matches!(state.presentation.style, ElicitationStyle::TextFallback)
+        && !field.needs_text_fallback()
+    {
+        match &field.kind {
+            FormFieldKind::Boolean => rows.push(CreateActionRow::Buttons(vec![
+                CreateButton::new(format!(
+                    "acp_elicit:{nonce}:bool:{}:true",
+                    state.current_field
+                ))
+                .label("True")
+                .style(ButtonStyle::Primary)
+                .disabled(disabled),
+                CreateButton::new(format!(
+                    "acp_elicit:{nonce}:bool:{}:false",
+                    state.current_field
+                ))
+                .label("False")
+                .style(ButtonStyle::Primary)
+                .disabled(disabled),
+            ])),
+            FormFieldKind::SingleSelect { choices } => {
+                let options = choices
+                    .iter()
+                    .take(SELECT_MENU_PAGE_SIZE)
+                    .map(|choice| {
+                        let mut option = CreateSelectMenuOption::new(
+                            truncate_for_discord(
+                                choice.label.as_deref().unwrap_or(&choice.value),
+                                SELECT_OPTION_TEXT_MAX,
+                            ),
+                            &choice.value,
+                        );
+                        if let Some(desc) = &choice.description {
+                            option = option
+                                .description(truncate_for_discord(desc, SELECT_OPTION_TEXT_MAX));
+                        }
+                        option
+                    })
+                    .collect();
+                rows.push(CreateActionRow::SelectMenu(CreateSelectMenu::new(
+                    format!("acp_elicit:{nonce}:select:{}", state.current_field),
+                    CreateSelectMenuKind::String { options },
+                )));
+            }
+            FormFieldKind::MultiSelect {
+                choices, max_items, ..
+            } => {
+                let options = choices
+                    .iter()
+                    .take(SELECT_MENU_PAGE_SIZE)
+                    .map(|choice| {
+                        CreateSelectMenuOption::new(
+                            truncate_for_discord(
+                                choice.label.as_deref().unwrap_or(&choice.value),
+                                SELECT_OPTION_TEXT_MAX,
+                            ),
+                            &choice.value,
+                        )
+                    })
+                    .collect();
+                let mut select = CreateSelectMenu::new(
+                    format!("acp_elicit:{nonce}:multi:{}", state.current_field),
+                    CreateSelectMenuKind::String { options },
+                );
+                let max = max_items.unwrap_or(choices.len()).clamp(1, 25);
+                if let Ok(max) = u8::try_from(max) {
+                    select = select.max_values(max);
+                }
+                rows.push(CreateActionRow::SelectMenu(select));
+            }
+            _ => rows.push(CreateActionRow::Buttons(vec![CreateButton::new(format!(
+                "acp_elicit:{nonce}:modal:{}",
+                state.current_field
+            ))
+            .label("Enter value")
+            .style(ButtonStyle::Primary)
+            .disabled(disabled)])),
+        }
+    }
+
+    let mut nav = Vec::new();
+    if !field.required || state.values.contains_key(&field.name) || field.default.is_some() {
+        nav.push(
+            CreateButton::new(format!("acp_elicit:{nonce}:skip:{}", state.current_field))
+                .label(
+                    if state.values.contains_key(&field.name) || field.default.is_some() {
+                        "Next"
+                    } else {
+                        "Skip"
+                    },
+                )
+                .style(ButtonStyle::Secondary)
+                .disabled(disabled),
+        );
+    }
+    nav.extend([
+        CreateButton::new(format!("acp_elicit:{nonce}:decline"))
+            .label("Decline")
+            .style(ButtonStyle::Danger)
+            .disabled(disabled),
+        CreateButton::new(format!("acp_elicit:{nonce}:cancel"))
+            .label("Cancel")
+            .style(ButtonStyle::Secondary)
+            .disabled(disabled),
+    ]);
+    rows.push(CreateActionRow::Buttons(nav));
+    rows
+}
+
+fn apply_text_reply(
+    state: &mut DiscordElicitationState,
+    content: &str,
+) -> Option<ElicitationOutcome> {
+    let trimmed = content.trim();
+    state.validation_error = None;
+    if let Some(command) = trimmed.strip_prefix("!form") {
+        let command = command.trim_start();
+        if command.eq_ignore_ascii_case("next") {
+            let full = current_full_elicitation_content(state, None);
+            let pages = split_display_pages(&full, 1750).len();
+            state.display_page = (state.display_page + 1).min(pages.saturating_sub(1));
+            return None;
+        }
+        if command.eq_ignore_ascii_case("prev") {
+            state.display_page = state.display_page.saturating_sub(1);
+            return None;
+        }
+        if command.eq_ignore_ascii_case("review") {
+            state.current_field = state.presentation.form.fields.len();
+            state.display_page = 0;
+            return None;
+        }
+        if command.eq_ignore_ascii_case("skip") {
+            if let Some(field) = state.presentation.form.fields.get(state.current_field) {
+                if field.required
+                    && !state.values.contains_key(&field.name)
+                    && field.default.is_none()
+                {
+                    state.validation_error = Some(format!("{} is required", field.display_name()));
+                } else {
+                    state.current_field =
+                        (state.current_field + 1).min(state.presentation.form.fields.len());
+                    state.display_page = 0;
+                }
+            }
+            return None;
+        }
+        if command.eq_ignore_ascii_case("submit") {
+            if let Err(err) = state.presentation.form.validate_content(&state.values) {
+                state.validation_error = Some(err.message);
+                return None;
+            }
+            return Some(ElicitationOutcome::Accept(state.values.clone()));
+        }
+        if command.eq_ignore_ascii_case("decline") {
+            return Some(ElicitationOutcome::Decline);
+        }
+        if command.eq_ignore_ascii_case("cancel") {
+            return Some(ElicitationOutcome::Cancel);
+        }
+        if let Some(rest) = command.strip_prefix("edit") {
+            match rest.trim().parse::<usize>() {
+                Ok(n) if (1..=state.presentation.form.fields.len()).contains(&n) => {
+                    state.current_field = n - 1;
+                    state.display_page = 0;
+                }
+                _ => {
+                    state.validation_error =
+                        Some("Use `!form edit N` with a field number from the review.".to_string())
+                }
+            }
+            return None;
+        }
+        if let Some(rest) = command.strip_prefix("value") {
+            return apply_current_field_text(state, rest.trim_start(), true);
+        }
+        if let Some(rest) = command.strip_prefix("choose") {
+            return apply_choice_numbers(state, rest);
+        }
+        state.validation_error = Some("Unknown form command.".to_string());
+        return None;
+    }
+    apply_current_field_text(state, trimmed, false)
+}
+
+fn apply_choice_numbers(
+    state: &mut DiscordElicitationState,
+    rest: &str,
+) -> Option<ElicitationOutcome> {
+    let Some(field) = state
+        .presentation
+        .form
+        .fields
+        .get(state.current_field)
+        .cloned()
+    else {
+        state.validation_error = Some("Use `!form edit N` before choosing a value.".to_string());
+        return None;
+    };
+    let numbers: Result<Vec<usize>, _> = rest.split_whitespace().map(str::parse::<usize>).collect();
+    let Ok(numbers) = numbers else {
+        state.validation_error =
+            Some("Use choice numbers, for example `!form choose 1 3`.".to_string());
+        return None;
+    };
+    let value = match &field.kind {
+        FormFieldKind::SingleSelect { choices } => numbers
+            .first()
+            .and_then(|n| choices.get(n.saturating_sub(1)))
+            .map(|c| Value::String(c.value.clone()))
+            .unwrap_or(Value::Null),
+        FormFieldKind::MultiSelect { choices, .. } => Value::Array(
+            numbers
+                .iter()
+                .filter_map(|n| choices.get(n.saturating_sub(1)))
+                .map(|c| Value::String(c.value.clone()))
+                .collect(),
+        ),
+        _ => {
+            state.validation_error = Some("The active field is not a choice field.".to_string());
+            return None;
+        }
+    };
+    apply_field_value(state, &field, value)
+}
+
+fn apply_current_field_text(
+    state: &mut DiscordElicitationState,
+    raw: &str,
+    json_value: bool,
+) -> Option<ElicitationOutcome> {
+    let Some(field) = state
+        .presentation
+        .form
+        .fields
+        .get(state.current_field)
+        .cloned()
+    else {
+        state.validation_error = Some("Use `!form edit N` before entering a value.".to_string());
+        return None;
+    };
+    let parsed = if json_value {
+        serde_json::from_str::<Value>(raw)
+            .map_err(|e| crate::acp::elicitation::ElicitationError::invalid_params(e.to_string()))
+    } else {
+        field.parse_user_text(raw)
+    };
+    match parsed {
+        Ok(value) => apply_field_value(state, &field, value),
+        Err(err) => {
+            state.validation_error = Some(err.message);
+            None
+        }
+    }
+}
+
+fn apply_field_value(
+    state: &mut DiscordElicitationState,
+    field: &crate::acp::elicitation::FormField,
+    value: Value,
+) -> Option<ElicitationOutcome> {
+    match field.validate_value(&value) {
+        Ok(()) => {
+            state.values.insert(field.name.clone(), value);
+            state.current_field =
+                (state.current_field + 1).min(state.presentation.form.fields.len());
+            state.display_page = 0;
+            None
+        }
+        Err(err) => {
+            state.validation_error = Some(err.message);
+            None
+        }
+    }
+}
+
+fn neutralize_agent_text(text: &str) -> String {
+    static URL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*)://").expect("valid URL neutralizer")
+    });
+    let cleaned: String = text
+        .replace('@', "＠")
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .collect();
+    let escaped: String = cleaned
+        .chars()
+        .flat_map(|c| match c {
+            '\\' | '*' | '_' | '~' | '`' | '|' | '>' | '[' | ']' | '(' | ')' | '#' => {
+                vec!['\\', c]
+            }
+            _ => vec![c],
+        })
+        .collect();
+    URL_RE.replace_all(&escaped, "$1[:]//").into_owned()
+}
+
+fn display_value(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(display_value)
+            .collect::<Vec<_>>()
+            .join(", "),
+        other => other.to_string(),
+    }
+}
+
+fn parse_elicitation_custom_id(
+    custom_id: &str,
+) -> Option<(&str, &str, Option<&str>, Option<&str>)> {
+    let parts: Vec<&str> = custom_id.split(':').collect();
+    if parts.first() != Some(&"acp_elicit") || parts.len() < 3 {
+        return None;
+    }
+    Some((
+        parts[1],
+        parts[2],
+        parts.get(3).copied(),
+        parts.get(4).copied(),
+    ))
+}
+
+fn modal_value(modal: &serenity::model::application::ModalInteraction) -> Option<String> {
+    modal.data.components.iter().find_map(|row| {
+        row.components
+            .first()
+            .and_then(|component| match component {
+                ActionRowComponent::InputText(input) => input.value.clone(),
+                _ => None,
+            })
+    })
+}
+
+async fn respond_ephemeral(
+    ctx: &Context,
+    comp: &serenity::model::application::ComponentInteraction,
+    content: &str,
+) {
+    let _ = comp
+        .create_response(
+            &ctx.http,
+            CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(content)
+                    .ephemeral(true),
+            ),
+        )
+        .await;
+}
+
 // --- DiscordAdapter: implements ChatAdapter for Discord via serenity ---
 
 pub struct DiscordAdapter {
     http: Arc<Http>,
+    elicitation: Arc<DiscordElicitationRegistry>,
 }
 
 impl DiscordAdapter {
     pub fn new(http: Arc<Http>) -> Self {
-        Self { http }
+        Self::from_parts(http.clone(), DiscordElicitationRegistry::new(http))
+    }
+
+    pub(crate) fn from_parts(
+        http: Arc<Http>,
+        elicitation: Arc<DiscordElicitationRegistry>,
+    ) -> Self {
+        Self { http, elicitation }
+    }
+
+    pub fn elicitation_registry(&self) -> Arc<DiscordElicitationRegistry> {
+        self.elicitation.clone()
     }
 
     /// Resolve the effective Discord channel ID from a ChannelRef.
@@ -86,6 +939,10 @@ impl ChatAdapter for DiscordAdapter {
 
     fn message_limit(&self) -> usize {
         2000
+    }
+
+    fn form_presenter(&self) -> Option<Arc<dyn FormPresenter>> {
+        Some(self.elicitation.clone())
     }
 
     async fn send_message(
@@ -212,7 +1069,11 @@ impl ChatAdapter for DiscordAdapter {
         let ch_id: u64 = Self::resolve_channel(channel).parse()?;
         // Truncate at char boundary to avoid panic on multi-byte chars (中文/Emoji).
         let truncated: &str = if title.chars().count() > 100 {
-            let end = title.char_indices().nth(100).map(|(i, _)| i).unwrap_or(title.len());
+            let end = title
+                .char_indices()
+                .nth(100)
+                .map(|(i, _)| i)
+                .unwrap_or(title.len());
             &title[..end]
         } else {
             title
@@ -234,6 +1095,7 @@ pub struct Handler {
     pub allowed_users: HashSet<u64>,
     pub stt_config: SttConfig,
     pub adapter: OnceLock<Arc<dyn ChatAdapter>>,
+    pub elicitation: Arc<DiscordElicitationRegistry>,
     /// Optional filestore for uploading file attachments.
     #[cfg(feature = "filestore")]
     pub filestore: Option<Arc<crate::filestore::Filestore>>,
@@ -356,7 +1218,9 @@ impl EventHandler for Handler {
             let key = msg.channel_id.to_string();
             {
                 let mut cache = self.multibot_threads.lock().await;
-                cache.entry(key.clone()).or_insert_with(tokio::time::Instant::now);
+                cache
+                    .entry(key.clone())
+                    .or_insert_with(tokio::time::Instant::now);
             }
             // Persist to disk — multibot is irreversible
             self.multibot_cache.mark_multibot(&key).await;
@@ -468,9 +1332,29 @@ impl EventHandler for Handler {
             return;
         }
 
+        if !msg.author.bot
+            && self
+                .elicitation
+                .handle_text_reply(
+                    &ctx.http,
+                    msg.channel_id,
+                    msg.author.id,
+                    msg.message_reference.as_ref().and_then(|r| r.message_id),
+                    &msg.content,
+                )
+                .await
+        {
+            return;
+        }
+
         let adapter = self
             .adapter
-            .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
+            .get_or_init(|| {
+                Arc::new(DiscordAdapter::from_parts(
+                    ctx.http.clone(),
+                    self.elicitation.clone(),
+                ))
+            })
             .clone();
 
         let channel_id = msg.channel_id.get();
@@ -499,11 +1383,14 @@ impl EventHandler for Handler {
         // non-allowed channels. Moved before bot gating so ambient context
         // can be resolved early — bot messages in ambient contexts must bypass
         // discord-level bot gating (#1197).
-        let (in_thread, bot_owns_thread, thread_parent_id, is_dm, is_structural_thread, structural_parent_id) = match msg
-            .channel_id
-            .to_channel(&ctx.http)
-            .await
-        {
+        let (
+            in_thread,
+            bot_owns_thread,
+            thread_parent_id,
+            is_dm,
+            is_structural_thread,
+            structural_parent_id,
+        ) = match msg.channel_id.to_channel(&ctx.http).await {
             Ok(serenity::model::channel::Channel::Guild(gc)) => {
                 let parent = gc.parent_id.map(|id| id.get().to_string());
                 let has_thread_metadata = gc.thread_metadata.is_some();
@@ -532,7 +1419,11 @@ impl EventHandler for Handler {
                     if has_thread_metadata { parent } else { None },
                     false,
                     has_thread_metadata,
-                    if has_thread_metadata { parent_u64 } else { None },
+                    if has_thread_metadata {
+                        parent_u64
+                    } else {
+                        None
+                    },
                 )
             }
             Ok(serenity::model::channel::Channel::Private(_)) => {
@@ -552,7 +1443,12 @@ impl EventHandler for Handler {
         // Check if message is in an ambient context (resolved early so bot
         // messages destined for ambient can bypass discord-level bot gating).
         let in_ambient_context = self.ambient.as_ref().is_some_and(|ambient| {
-            ambient.should_buffer(channel_id, is_structural_thread, bot_owns_thread, structural_parent_id)
+            ambient.should_buffer(
+                channel_id,
+                is_structural_thread,
+                bot_owns_thread,
+                structural_parent_id,
+            )
         });
 
         // --- Ambient early-route for bot messages ---
@@ -599,13 +1495,15 @@ impl EventHandler for Handler {
 
                     let target = Arc::clone(&self.router) as Arc<dyn DispatchTarget>;
                     debug!(channel_id = %msg.channel_id, bot_id = %msg.author.id, "ambient early-route: bot msg buffered");
-                    ambient.submit(
-                        &channel_id.to_string(),
-                        channel_ref,
-                        adapter.clone(),
-                        target,
-                        ambient_msg,
-                    ).await;
+                    ambient
+                        .submit(
+                            &channel_id.to_string(),
+                            channel_ref,
+                            adapter.clone(),
+                            target,
+                            ambient_msg,
+                        )
+                        .await;
                 }
             }
             return;
@@ -761,13 +1659,15 @@ impl EventHandler for Handler {
                     };
 
                     let target = Arc::clone(&self.router) as Arc<dyn DispatchTarget>;
-                    ambient.submit(
-                        &channel_id.to_string(),
-                        channel_ref,
-                        adapter.clone(),
-                        target,
-                        ambient_msg,
-                    ).await;
+                    ambient
+                        .submit(
+                            &channel_id.to_string(),
+                            channel_ref,
+                            adapter.clone(),
+                            target,
+                            ambient_msg,
+                        )
+                        .await;
                     return;
                 }
             }
@@ -918,7 +1818,8 @@ impl EventHandler for Handler {
                 // be uploaded to S3, not inlined).
                 let attachment_size = u64::from(attachment.size);
                 #[cfg(feature = "filestore")]
-                let skip_cap = self.filestore.is_some() && attachment_size > crate::media::TEXT_INLINE_LIMIT;
+                let skip_cap =
+                    self.filestore.is_some() && attachment_size > crate::media::TEXT_INLINE_LIMIT;
                 #[cfg(not(feature = "filestore"))]
                 let skip_cap = false;
                 if !skip_cap && text_file_bytes + attachment_size > TEXT_TOTAL_CAP {
@@ -999,7 +1900,9 @@ impl EventHandler for Handler {
                                     attachment.content_type.as_deref(),
                                     None,
                                     fs,
-                                ).await {
+                                )
+                                .await
+                                {
                                     extra_blocks.push(block);
                                 }
                             }
@@ -1064,10 +1967,11 @@ impl EventHandler for Handler {
         let trigger_msg = discord_msg_ref(&msg);
 
         // Per-thread streaming: check if another bot is present in this thread
-        let other_bot_present_flag = {
-            let cache = self.multibot_threads.lock().await;
-            cache.contains_key(&msg.channel_id.to_string())
-        } || self.multibot_cache.is_multibot(&msg.channel_id.to_string());
+        let other_bot_present_flag =
+            {
+                let cache = self.multibot_threads.lock().await;
+                cache.contains_key(&msg.channel_id.to_string())
+            } || self.multibot_cache.is_multibot(&msg.channel_id.to_string());
 
         // Backfill thread_id: when OAB just created a new thread, the sender
         // was built before the thread existed. Patch it so the agent sees
@@ -1129,6 +2033,8 @@ impl EventHandler for Handler {
             let buf_msg = crate::dispatch::BufferedMessage {
                 sender_json,
                 sender_name,
+                sender_id: sender_id.clone(),
+                sender_is_bot: msg.author.bot,
                 prompt,
                 extra_blocks,
                 trigger_msg,
@@ -1201,7 +2107,12 @@ impl EventHandler for Handler {
 
         let adapter = self
             .adapter
-            .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
+            .get_or_init(|| {
+                Arc::new(DiscordAdapter::from_parts(
+                    ctx.http.clone(),
+                    self.elicitation.clone(),
+                ))
+            })
             .clone();
 
         let channel_id = reaction.channel_id;
@@ -1236,24 +2147,30 @@ impl EventHandler for Handler {
                     if !in_allowed_thread {
                         return;
                     }
-                    (ChannelRef {
-                        platform: "discord".into(),
-                        channel_id: channel_id.get().to_string(),
-                        thread_id: None,
-                        parent_id: parent.map(|p| p.to_string()),
-                        origin_event_id: None,
-                    }, true)
+                    (
+                        ChannelRef {
+                            platform: "discord".into(),
+                            channel_id: channel_id.get().to_string(),
+                            thread_id: None,
+                            parent_id: parent.map(|p| p.to_string()),
+                            origin_event_id: None,
+                        },
+                        true,
+                    )
                 } else {
                     if !in_allowed_channel {
                         return;
                     }
-                    (ChannelRef {
-                        platform: "discord".into(),
-                        channel_id: channel_id.get().to_string(),
-                        thread_id: None,
-                        parent_id: None,
-                        origin_event_id: None,
-                    }, false)
+                    (
+                        ChannelRef {
+                            platform: "discord".into(),
+                            channel_id: channel_id.get().to_string(),
+                            thread_id: None,
+                            parent_id: None,
+                            origin_event_id: None,
+                        },
+                        false,
+                    )
                 }
             }
             _ => return,
@@ -1267,7 +2184,8 @@ impl EventHandler for Handler {
                 self.allow_user_messages,
                 AllowUsers::Involved | AllowUsers::MultibotMentions
             ) {
-            self.bot_participated_in_thread(&ctx.http, channel_id, bot_id).await
+            self.bot_participated_in_thread(&ctx.http, channel_id, bot_id)
+                .await
         } else {
             // For non-thread: still check multibot cache for dispatch info.
             let mb = {
@@ -1301,17 +2219,16 @@ impl EventHandler for Handler {
 
         tokio::spawn(async move {
             // F2 fix: Fetch user info first, then apply user gating with confirmed bot status.
-            let (sender_name, display_name, is_bot_confirmed) =
-                match user_id.to_user(&http).await {
-                    Ok(user) => {
-                        let display = user.global_name.as_ref().unwrap_or(&user.name).clone();
-                        (user.name.clone(), display, user.bot)
-                    }
-                    Err(_) => {
-                        let fallback = user_id.to_string();
-                        (fallback.clone(), fallback, is_reactor_bot)
-                    }
-                };
+            let (sender_name, display_name, is_bot_confirmed) = match user_id.to_user(&http).await {
+                Ok(user) => {
+                    let display = user.global_name.as_ref().unwrap_or(&user.name).clone();
+                    (user.name.clone(), display, user.bot)
+                }
+                Err(_) => {
+                    let fallback = user_id.to_string();
+                    (fallback.clone(), fallback, is_reactor_bot)
+                }
+            };
 
             // Defense-in-depth: if to_user() reveals this is a bot but member was
             // None (rare edge case), re-apply bot gating retroactively.
@@ -1319,8 +2236,7 @@ impl EventHandler for Handler {
                 match allow_bot_messages {
                     AllowBots::Off | AllowBots::Mentions => return,
                     AllowBots::All => {
-                        if !trusted_bot_ids.is_empty()
-                            && !trusted_bot_ids.contains(&user_id.get())
+                        if !trusted_bot_ids.is_empty() && !trusted_bot_ids.contains(&user_id.get())
                         {
                             return;
                         }
@@ -1370,6 +2286,8 @@ impl EventHandler for Handler {
             let buf_msg = crate::dispatch::BufferedMessage {
                 sender_json,
                 sender_name: sender_name_clone,
+                sender_id: sender_id.clone(),
+                sender_is_bot: is_bot_confirmed,
                 prompt,
                 extra_blocks: Vec::new(),
                 trigger_msg,
@@ -1401,23 +2319,31 @@ impl EventHandler for Handler {
             CreateCommand::new("reset").description("Reset the conversation session"),
             CreateCommand::new("remind")
                 .description("Set a one-shot reminder to mention users/roles after a delay")
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "targets",
-                    "Users/roles to mention (e.g. @user1 @role1)",
-                ).required(true))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "message",
-                    "Reminder message",
-                ).required(true))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "delay",
-                    "Delay before firing (e.g. 30m, 2h, 1d)",
-                ).required(true)),
-            CreateCommand::new("auth")
-                .description("Authenticate the backend agent (device flow)"),
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "targets",
+                        "Users/roles to mention (e.g. @user1 @role1)",
+                    )
+                    .required(true),
+                )
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "message",
+                        "Reminder message",
+                    )
+                    .required(true),
+                )
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "delay",
+                        "Delay before firing (e.g. 30m, 2h, 1d)",
+                    )
+                    .required(true),
+                ),
+            CreateCommand::new("auth").description("Authenticate the backend agent (device flow)"),
             CreateCommand::new("usage")
                 .description("Show backend account usage and billing information"),
             CreateCommand::new("export-thread")
@@ -1513,6 +2439,12 @@ impl EventHandler for Handler {
             }
             Interaction::Command(cmd) if cmd.data.name == "usage" => {
                 self.handle_usage_command(&ctx, &cmd).await;
+            }
+            Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_elicit:") => {
+                self.handle_elicitation_component(&ctx, &comp).await;
+            }
+            Interaction::Modal(modal) if modal.data.custom_id.starts_with("acp_elicit:") => {
+                self.handle_elicitation_modal(&ctx, &modal).await;
             }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_config_") => {
                 self.handle_config_select(&ctx, &comp).await;
@@ -1693,7 +2625,9 @@ impl Handler {
         if !self.router.pool().has_active_session(&thread_key).await {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content("⚠️ No active session. Start a conversation first by @mentioning the bot.")
+                    .content(
+                        "⚠️ No active session. Start a conversation first by @mentioning the bot.",
+                    )
                     .ephemeral(true),
             );
             if let Err(e) = cmd.create_response(&ctx.http, response).await {
@@ -1704,8 +2638,9 @@ impl Handler {
 
         // The ACP round-trip can exceed Discord's 3-second interaction
         // deadline — acknowledge with a deferred ephemeral response first.
-        let defer =
-            CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new().ephemeral(true));
+        let defer = CreateInteractionResponse::Defer(
+            CreateInteractionResponseMessage::new().ephemeral(true),
+        );
         if let Err(e) = cmd.create_response(&ctx.http, defer).await {
             tracing::error!(error = %e, "failed to defer /usage response");
             return;
@@ -1842,15 +2777,18 @@ impl Handler {
 
         // Extract options
         let opts = &cmd.data.options;
-        let targets_raw = opts.iter()
+        let targets_raw = opts
+            .iter()
             .find(|o| o.name == "targets")
             .and_then(|o| o.value.as_str())
             .unwrap_or("");
-        let message = opts.iter()
+        let message = opts
+            .iter()
             .find(|o| o.name == "message")
             .and_then(|o| o.value.as_str())
             .unwrap_or("");
-        let delay_raw = opts.iter()
+        let delay_raw = opts
+            .iter()
             .find(|o| o.name == "delay")
             .and_then(|o| o.value.as_str())
             .unwrap_or("");
@@ -1912,7 +2850,10 @@ impl Handler {
         if targets.len() > remind::MAX_TARGETS {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content(format!("⚠️ Too many targets (max {}). Use a @role instead.", remind::MAX_TARGETS))
+                    .content(format!(
+                        "⚠️ Too many targets (max {}). Use a @role instead.",
+                        remind::MAX_TARGETS
+                    ))
                     .ephemeral(true),
             );
             let _ = cmd.create_response(&ctx.http, response).await;
@@ -2012,7 +2953,9 @@ impl Handler {
         if AUTH_IN_PROGRESS.swap(true, std::sync::atomic::Ordering::Acquire) {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content("⚠️ Authentication already in progress. Please wait for it to complete.")
+                    .content(
+                        "⚠️ Authentication already in progress. Please wait for it to complete.",
+                    )
                     .ephemeral(true),
             );
             let _ = cmd.create_response(&ctx.http, response).await;
@@ -2025,7 +2968,9 @@ impl Handler {
                 AUTH_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
                 let response = CreateInteractionResponse::Message(
                     CreateInteractionResponseMessage::new()
-                        .content("⚠️ No auth command configured (`OPENAB_AGENT_AUTH_COMMAND` not set).")
+                        .content(
+                            "⚠️ No auth command configured (`OPENAB_AGENT_AUTH_COMMAND` not set).",
+                        )
                         .ephemeral(true),
                 );
                 let _ = cmd.create_response(&ctx.http, response).await;
@@ -2048,9 +2993,9 @@ impl Handler {
         let user_id = cmd.user.id.get();
 
         tokio::spawn(async move {
+            use std::sync::Arc;
             use tokio::io::AsyncBufReadExt;
             use tokio::process::Command as TokioCommand;
-            use std::sync::Arc;
 
             // Drop guard ensures AUTH_IN_PROGRESS is cleared even on panic.
             struct AuthGuard;
@@ -2074,13 +3019,15 @@ impl Handler {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!(error = %e, "/auth: failed to spawn auth command");
-                    let _ = http.create_followup_message(
-                        &token,
-                        &CreateInteractionResponseFollowup::new()
-                            .content(format!("❌ Failed to start auth command: {e}"))
-                            .ephemeral(true),
-                        Vec::new(),
-                    ).await;
+                    let _ = http
+                        .create_followup_message(
+                            &token,
+                            &CreateInteractionResponseFollowup::new()
+                                .content(format!("❌ Failed to start auth command: {e}"))
+                                .ephemeral(true),
+                            Vec::new(),
+                        )
+                        .await;
                     return;
                 }
             };
@@ -2099,7 +3046,10 @@ impl Handler {
                     let mut reader = tokio::io::BufReader::new(stdout).lines();
                     while let Ok(Some(line)) = reader.next_line().await {
                         let has_url = line.contains("http://") || line.contains("https://");
-                        lines_out.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+                        lines_out
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(line);
                         if has_url {
                             url_found_out.notify_one();
                         }
@@ -2114,7 +3064,10 @@ impl Handler {
                     let mut reader = tokio::io::BufReader::new(stderr).lines();
                     while let Ok(Some(line)) = reader.next_line().await {
                         let has_url = line.contains("http://") || line.contains("https://");
-                        lines_err.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+                        lines_err
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(line);
                         if has_url {
                             url_found_err.notify_one();
                         }
@@ -2144,12 +3097,8 @@ impl Handler {
             // Handle an early exit (the command terminated during the URL window).
             if let Some(res) = early_exit {
                 let _ = tokio::join!(stdout_task, stderr_task);
-                let collected = strip_ansi_codes(
-                    &lines
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .join("\n"),
-                );
+                let collected =
+                    strip_ansi_codes(&lines.lock().unwrap_or_else(|e| e.into_inner()).join("\n"));
                 let detail = if collected.trim().is_empty() {
                     String::new()
                 } else {
@@ -2169,13 +3118,15 @@ impl Handler {
                     }
                     Err(e) => format!("❌ Error waiting for auth command: {e}"),
                 };
-                let _ = http.create_followup_message(
-                    &token,
-                    &CreateInteractionResponseFollowup::new()
-                        .content(content)
-                        .ephemeral(true),
-                    Vec::new(),
-                ).await;
+                let _ = http
+                    .create_followup_message(
+                        &token,
+                        &CreateInteractionResponseFollowup::new()
+                            .content(content)
+                            .ephemeral(true),
+                        Vec::new(),
+                    )
+                    .await;
                 return;
             }
 
@@ -2206,13 +3157,15 @@ impl Handler {
             // `truncate_to_utf16_budget` for the testable implementation.
             let truncated = truncate_to_utf16_budget(&output, prefix, suffix, 2000);
             let msg = format!("{prefix}{truncated}{suffix}");
-            let _ = http.create_followup_message(
-                &token,
-                &CreateInteractionResponseFollowup::new()
-                    .content(msg)
-                    .ephemeral(true),
-                Vec::new(),
-            ).await;
+            let _ = http
+                .create_followup_message(
+                    &token,
+                    &CreateInteractionResponseFollowup::new()
+                        .content(msg)
+                        .ephemeral(true),
+                    Vec::new(),
+                )
+                .await;
 
             // Wait for the process to complete (user authorizes in browser).
             // Use 14min (not 15) to leave headroom for the Discord interaction token TTL.
@@ -2220,44 +3173,55 @@ impl Handler {
             match tokio::time::timeout(timeout, child.wait()).await {
                 Ok(Ok(status)) if status.success() => {
                     info!("/auth: authentication successful");
-                    let _ = http.create_followup_message(
-                        &token,
-                        &CreateInteractionResponseFollowup::new()
-                            .content("✅ Authentication successful!")
-                            .ephemeral(true),
-                        Vec::new(),
-                    ).await;
+                    let _ = http
+                        .create_followup_message(
+                            &token,
+                            &CreateInteractionResponseFollowup::new()
+                                .content("✅ Authentication successful!")
+                                .ephemeral(true),
+                            Vec::new(),
+                        )
+                        .await;
                 }
                 Ok(Ok(status)) => {
                     warn!(%status, "/auth: authentication failed");
-                    let _ = http.create_followup_message(
-                        &token,
-                        &CreateInteractionResponseFollowup::new()
-                            .content(format!("❌ Authentication failed (exit code: {}).", status))
-                            .ephemeral(true),
-                        Vec::new(),
-                    ).await;
+                    let _ = http
+                        .create_followup_message(
+                            &token,
+                            &CreateInteractionResponseFollowup::new()
+                                .content(format!(
+                                    "❌ Authentication failed (exit code: {}).",
+                                    status
+                                ))
+                                .ephemeral(true),
+                            Vec::new(),
+                        )
+                        .await;
                 }
                 Ok(Err(e)) => {
                     tracing::error!(error = %e, "/auth: error waiting for auth process");
-                    let _ = http.create_followup_message(
-                        &token,
-                        &CreateInteractionResponseFollowup::new()
-                            .content(format!("❌ Auth process error: {e}"))
-                            .ephemeral(true),
-                        Vec::new(),
-                    ).await;
+                    let _ = http
+                        .create_followup_message(
+                            &token,
+                            &CreateInteractionResponseFollowup::new()
+                                .content(format!("❌ Auth process error: {e}"))
+                                .ephemeral(true),
+                            Vec::new(),
+                        )
+                        .await;
                 }
                 Err(_) => {
                     warn!("/auth: timed out waiting for authorization");
                     let _ = child.kill().await;
-                    let _ = http.create_followup_message(
-                        &token,
-                        &CreateInteractionResponseFollowup::new()
-                            .content("⏰ Authentication timed out. Run `/auth` again to retry.")
-                            .ephemeral(true),
-                        Vec::new(),
-                    ).await;
+                    let _ = http
+                        .create_followup_message(
+                            &token,
+                            &CreateInteractionResponseFollowup::new()
+                                .content("⏰ Authentication timed out. Run `/auth` again to retry.")
+                                .ephemeral(true),
+                            Vec::new(),
+                        )
+                        .await;
                 }
             }
 
@@ -2304,9 +3268,7 @@ impl Handler {
                 );
                 (in_thread, gc.name.clone())
             }
-            Ok(serenity::model::channel::Channel::Private(_)) => {
-                (self.allow_dm, "dm".to_string())
-            }
+            Ok(serenity::model::channel::Channel::Private(_)) => (self.allow_dm, "dm".to_string()),
             Ok(_) => (false, "channel".to_string()),
             Err(e) => {
                 tracing::warn!(channel_id = %channel_id, error = %e, "failed to inspect channel for export");
@@ -2328,16 +3290,34 @@ impl Handler {
 
         // --- Parse and validate filter params (mutual exclusion) ---
         let opts = &cmd.data.options;
-        let limit_opt = opts.iter().find(|o| o.name == "limit").and_then(|o| o.value.as_i64());
-        let since_opt = opts.iter().find(|o| o.name == "since").and_then(|o| o.value.as_str());
-        let days_opt = opts.iter().find(|o| o.name == "days").and_then(|o| o.value.as_i64());
-        let all_opt = opts.iter().find(|o| o.name == "all").and_then(|o| o.value.as_bool()).unwrap_or(false);
+        let limit_opt = opts
+            .iter()
+            .find(|o| o.name == "limit")
+            .and_then(|o| o.value.as_i64());
+        let since_opt = opts
+            .iter()
+            .find(|o| o.name == "since")
+            .and_then(|o| o.value.as_str());
+        let days_opt = opts
+            .iter()
+            .find(|o| o.name == "days")
+            .and_then(|o| o.value.as_i64());
+        let all_opt = opts
+            .iter()
+            .find(|o| o.name == "all")
+            .and_then(|o| o.value.as_bool())
+            .unwrap_or(false);
 
-        let filter_count = limit_opt.is_some() as u8 + since_opt.is_some() as u8 + days_opt.is_some() as u8 + all_opt as u8;
+        let filter_count = limit_opt.is_some() as u8
+            + since_opt.is_some() as u8
+            + days_opt.is_some() as u8
+            + all_opt as u8;
         if filter_count > 1 {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content("⚠️ Please specify only one filter: `limit`, `since`, `days`, or `all`.")
+                    .content(
+                        "⚠️ Please specify only one filter: `limit`, `since`, `days`, or `all`.",
+                    )
                     .ephemeral(true),
             );
             let _ = cmd.create_response(&ctx.http, response).await;
@@ -2441,6 +3421,360 @@ impl Handler {
                 }
             }
         }
+    }
+
+    async fn handle_elicitation_component(
+        &self,
+        ctx: &Context,
+        comp: &serenity::model::application::ComponentInteraction,
+    ) {
+        let Some((nonce, action, field_ref, value_part)) =
+            parse_elicitation_custom_id(&comp.data.custom_id)
+        else {
+            return;
+        };
+        let registry = self.elicitation.clone();
+        let mut states = registry.states.lock().await;
+        let Some(state) = states.get_mut(nonce) else {
+            drop(states);
+            respond_ephemeral(ctx, comp, "This form is no longer active.").await;
+            return;
+        };
+        if state.outcome_tx.is_none()
+            || state.message_id != comp.message.id.to_string()
+            || state.presentation.channel.channel_id != comp.channel_id.to_string()
+            || !state
+                .presentation
+                .authorized_user_ids
+                .contains(&comp.user.id.to_string())
+        {
+            drop(states);
+            respond_ephemeral(ctx, comp, "You cannot answer this form.").await;
+            return;
+        }
+
+        if action == "modal" {
+            let Some(index) = field_ref.and_then(|s| s.parse::<usize>().ok()) else {
+                return;
+            };
+            if index != state.current_field {
+                drop(states);
+                respond_ephemeral(ctx, comp, "This form field is no longer active.").await;
+                return;
+            }
+            let Some(field) = state.presentation.form.fields.get(index) else {
+                return;
+            };
+            let mut input = CreateInputText::new(
+                InputTextStyle::Paragraph,
+                truncate_for_discord(field.display_name(), 45),
+                "value",
+            )
+            .required(field.required);
+            if let Some(value) = state.values.get(&field.name).or(field.default.as_ref()) {
+                input = input.value(truncate_for_discord(&display_value(value), 4000));
+            }
+            let modal = CreateModal::new(
+                format!("acp_elicit:{nonce}:modal_value:{index}"),
+                truncate_for_discord(field.display_name(), 45),
+            )
+            .components(vec![CreateActionRow::InputText(input)]);
+            drop(states);
+            let _ = comp
+                .create_response(&ctx.http, CreateInteractionResponse::Modal(modal))
+                .await;
+            return;
+        }
+
+        let response = match action {
+            "next" => {
+                let full = current_full_elicitation_content(state, None);
+                let pages = split_display_pages(&full, 1750).len();
+                state.display_page = (state.display_page + 1).min(pages.saturating_sub(1));
+                CreateInteractionResponse::UpdateMessage(
+                    CreateInteractionResponseMessage::new()
+                        .content(render_elicitation_content(state, None))
+                        .allowed_mentions(no_mentions())
+                        .components(render_elicitation_components(state, false)),
+                )
+            }
+            "prev" => {
+                state.display_page = state.display_page.saturating_sub(1);
+                CreateInteractionResponse::UpdateMessage(
+                    CreateInteractionResponseMessage::new()
+                        .content(render_elicitation_content(state, None))
+                        .allowed_mentions(no_mentions())
+                        .components(render_elicitation_components(state, false)),
+                )
+            }
+            "bool" => {
+                if let (Some(index), Some(value_part)) =
+                    (field_ref.and_then(|s| s.parse::<usize>().ok()), value_part)
+                {
+                    if index == state.current_field {
+                        if let Some(field) = state.presentation.form.fields.get(index) {
+                            let value = Value::Bool(value_part == "true");
+                            if let Err(err) = field.validate_value(&value) {
+                                let response = CreateInteractionResponse::UpdateMessage(
+                                    CreateInteractionResponseMessage::new()
+                                        .content(render_elicitation_content(
+                                            state,
+                                            Some(&err.message),
+                                        ))
+                                        .allowed_mentions(no_mentions())
+                                        .components(render_elicitation_components(state, false)),
+                                );
+                                drop(states);
+                                let _ = comp.create_response(&ctx.http, response).await;
+                                return;
+                            }
+                            state.values.insert(field.name.clone(), value);
+                            state.current_field =
+                                (state.current_field + 1).min(state.presentation.form.fields.len());
+                            state.display_page = 0;
+                        }
+                    }
+                }
+                CreateInteractionResponse::UpdateMessage(
+                    CreateInteractionResponseMessage::new()
+                        .content(render_elicitation_content(state, None))
+                        .allowed_mentions(no_mentions())
+                        .components(render_elicitation_components(state, false)),
+                )
+            }
+            "select" | "multi" => {
+                if let Some(index) = field_ref.and_then(|s| s.parse::<usize>().ok()) {
+                    if index == state.current_field {
+                        if let Some(field) = state.presentation.form.fields.get(index) {
+                            let value = match &comp.data.kind {
+                                ComponentInteractionDataKind::StringSelect { values }
+                                    if action == "multi" =>
+                                {
+                                    Value::Array(
+                                        values.iter().cloned().map(Value::String).collect(),
+                                    )
+                                }
+                                ComponentInteractionDataKind::StringSelect { values } => values
+                                    .first()
+                                    .cloned()
+                                    .map(Value::String)
+                                    .unwrap_or(Value::Null),
+                                _ => Value::Null,
+                            };
+                            if let Err(err) = field.validate_value(&value) {
+                                let response = CreateInteractionResponse::UpdateMessage(
+                                    CreateInteractionResponseMessage::new()
+                                        .content(render_elicitation_content(
+                                            state,
+                                            Some(&err.message),
+                                        ))
+                                        .allowed_mentions(no_mentions())
+                                        .components(render_elicitation_components(state, false)),
+                                );
+                                drop(states);
+                                let _ = comp.create_response(&ctx.http, response).await;
+                                return;
+                            }
+                            state.values.insert(field.name.clone(), value);
+                            state.current_field =
+                                (state.current_field + 1).min(state.presentation.form.fields.len());
+                            state.display_page = 0;
+                        }
+                    }
+                }
+                CreateInteractionResponse::UpdateMessage(
+                    CreateInteractionResponseMessage::new()
+                        .content(render_elicitation_content(state, None))
+                        .allowed_mentions(no_mentions())
+                        .components(render_elicitation_components(state, false)),
+                )
+            }
+            "skip" => {
+                if let Some(index) = field_ref.and_then(|s| s.parse::<usize>().ok()) {
+                    if index == state.current_field {
+                        state.current_field =
+                            (state.current_field + 1).min(state.presentation.form.fields.len());
+                        state.display_page = 0;
+                    }
+                }
+                CreateInteractionResponse::UpdateMessage(
+                    CreateInteractionResponseMessage::new()
+                        .content(render_elicitation_content(state, None))
+                        .allowed_mentions(no_mentions())
+                        .components(render_elicitation_components(state, false)),
+                )
+            }
+            "modify" => {
+                if let Some(index) = field_ref.and_then(|s| s.parse::<usize>().ok()) {
+                    state.current_field = index.min(state.presentation.form.fields.len());
+                    state.display_page = 0;
+                }
+                CreateInteractionResponse::UpdateMessage(
+                    CreateInteractionResponseMessage::new()
+                        .content(render_elicitation_content(state, None))
+                        .allowed_mentions(no_mentions())
+                        .components(render_elicitation_components(state, false)),
+                )
+            }
+            "submit" => {
+                if let Err(err) = state.presentation.form.validate_content(&state.values) {
+                    CreateInteractionResponse::UpdateMessage(
+                        CreateInteractionResponseMessage::new()
+                            .content(render_elicitation_content(state, Some(&err.message)))
+                            .allowed_mentions(no_mentions())
+                            .components(render_elicitation_components(state, false)),
+                    )
+                } else {
+                    let values = state.values.clone();
+                    let user_id = comp.user.id.to_string();
+                    let channel = state.presentation.channel.clone();
+                    drop(states);
+                    registry
+                        .complete(
+                            nonce,
+                            &user_id,
+                            &channel,
+                            None,
+                            ElicitationOutcome::Accept(values),
+                        )
+                        .await;
+                    let _ = comp
+                        .create_response(&ctx.http, CreateInteractionResponse::Acknowledge)
+                        .await;
+                    return;
+                }
+            }
+            "decline" => {
+                let user_id = comp.user.id.to_string();
+                let channel = state.presentation.channel.clone();
+                drop(states);
+                registry
+                    .complete(nonce, &user_id, &channel, None, ElicitationOutcome::Decline)
+                    .await;
+                let _ = comp
+                    .create_response(&ctx.http, CreateInteractionResponse::Acknowledge)
+                    .await;
+                return;
+            }
+            "cancel" => {
+                let user_id = comp.user.id.to_string();
+                let channel = state.presentation.channel.clone();
+                drop(states);
+                registry
+                    .complete(nonce, &user_id, &channel, None, ElicitationOutcome::Cancel)
+                    .await;
+                let _ = comp
+                    .create_response(&ctx.http, CreateInteractionResponse::Acknowledge)
+                    .await;
+                return;
+            }
+            _ => return,
+        };
+        drop(states);
+        let _ = comp.create_response(&ctx.http, response).await;
+    }
+
+    async fn handle_elicitation_modal(
+        &self,
+        ctx: &Context,
+        modal: &serenity::model::application::ModalInteraction,
+    ) {
+        let Some((nonce, action, field_ref, _)) =
+            parse_elicitation_custom_id(&modal.data.custom_id)
+        else {
+            return;
+        };
+        if action != "modal_value" {
+            return;
+        }
+        let Some(index) = field_ref.and_then(|s| s.parse::<usize>().ok()) else {
+            return;
+        };
+        let registry = self.elicitation.clone();
+        let mut states = registry.states.lock().await;
+        let Some(state) = states.get_mut(nonce) else {
+            drop(states);
+            let _ = modal
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("This form is no longer active.")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        };
+        if state.outcome_tx.is_none()
+            || state.presentation.channel.channel_id != modal.channel_id.to_string()
+            || !state
+                .presentation
+                .authorized_user_ids
+                .contains(&modal.user.id.to_string())
+        {
+            drop(states);
+            let _ = modal
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("You cannot answer this form.")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        }
+        if index != state.current_field {
+            drop(states);
+            let _ = modal
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("This form field is no longer active.")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        }
+        let Some(field) = state.presentation.form.fields.get(index).cloned() else {
+            return;
+        };
+        let raw = modal_value(modal).unwrap_or_default();
+        let error = match field.parse_user_text(&raw) {
+            Ok(value) => {
+                state.values.insert(field.name.clone(), value);
+                state.current_field =
+                    (state.current_field + 1).min(state.presentation.form.fields.len());
+                state.display_page = 0;
+                None
+            }
+            Err(err) => Some(err.message),
+        };
+        let content = render_elicitation_content(state, error.as_deref());
+        let components = render_elicitation_components(state, false);
+        let Ok(message_id) = state.message_id.parse::<u64>() else {
+            return;
+        };
+        let channel_id = modal.channel_id;
+        drop(states);
+        let _ = modal
+            .create_response(&ctx.http, CreateInteractionResponse::Acknowledge)
+            .await;
+        let _ = ChannelId::new(channel_id.get())
+            .edit_message(
+                &ctx.http,
+                MessageId::new(message_id),
+                EditMessage::new()
+                    .content(content)
+                    .allowed_mentions(no_mentions())
+                    .suppress_embeds(true)
+                    .components(components),
+            )
+            .await;
     }
 
     async fn handle_config_select(
@@ -2605,8 +3939,7 @@ fn format_usage_body(report: &UsageReport) -> (String, bool) {
 fn build_usage_reply(report: &UsageReport) -> (String, CreateEmbed) {
     let (body, over_limit) = format_usage_body(report);
     let content = format!("📊 **Usage — {}**\n{}", report.plan_name, body);
-    let mut embed =
-        CreateEmbed::new().colour(if over_limit { 0xE74C3C } else { 0x2ECC71 });
+    let mut embed = CreateEmbed::new().colour(if over_limit { 0xE74C3C } else { 0x2ECC71 });
     if let Some(reset) = &report.billing_cycle_reset {
         embed = embed.footer(CreateEmbedFooter::new(format!(
             "Billing cycle resets {reset}"
@@ -2776,7 +4109,10 @@ async fn export_channel_messages(
 
     let filename = export_filename(channel_id, channel_name);
     if attachment_size_limit < 2048 {
-        tracing::warn!(attachment_size_limit, "attachment_size_limit is very small; export will likely be truncated");
+        tracing::warn!(
+            attachment_size_limit,
+            "attachment_size_limit is very small; export will likely be truncated"
+        );
     }
     let max_bytes = usize::try_from(attachment_size_limit)
         .unwrap_or(8 * 1024 * 1024)
@@ -2846,10 +4182,7 @@ fn format_export_message(msg: &Message) -> String {
     let bot_marker = if msg.author.bot { " [bot]" } else { "" };
     let mut out = format!(
         "[{}] {}{} ({})\n",
-        msg.timestamp,
-        msg.author.name,
-        bot_marker,
-        msg.author.id
+        msg.timestamp, msg.author.name, bot_marker, msg.author.id
     );
 
     if msg.content.is_empty() {
@@ -3268,7 +4601,133 @@ fn truncate_to_utf16_budget(body: &str, prefix: &str, suffix: &str, limit: usize
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bot_turns::{TurnResult, HARD_BOT_TURN_LIMIT, BOT_TURN_LIMIT_WARNING_PREFIX};
+    use crate::bot_turns::{TurnResult, BOT_TURN_LIMIT_WARNING_PREFIX, HARD_BOT_TURN_LIMIT};
+
+    fn test_elicitation_state(choice_count: usize) -> DiscordElicitationState {
+        let choices: Vec<serde_json::Value> = (0..choice_count)
+            .map(|i| serde_json::Value::String(format!("choice-{i}")))
+            .collect();
+        let form = crate::acp::elicitation::FormSchema::from_requested_schema(&serde_json::json!({
+            "type": "object",
+            "properties": {
+                "choice": {"type": "string", "enum": choices},
+                "confirm": {"type": "boolean", "default": true}
+            },
+            "required": ["choice", "confirm"]
+        }))
+        .unwrap();
+        let channel = ChannelRef {
+            platform: "discord".into(),
+            channel_id: "10".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: None,
+        };
+        DiscordElicitationState {
+            presentation: ElicitationPresentation {
+                nonce: "nonce".into(),
+                generation: crate::acp::elicitation::ConnectionGeneration::new(),
+                coordinator: crate::acp::elicitation::ElicitationCoordinator::new(),
+                agent_request_id: crate::acp::protocol::JsonRpcId::Number(1),
+                agent_name: "agent @everyone".into(),
+                message: "go to https://example.com".into(),
+                form,
+                channel: channel.clone(),
+                trigger_message: MessageRef {
+                    channel,
+                    message_id: "99".into(),
+                },
+                authorized_user_ids: HashSet::from(["user-a".into()]),
+                style: ElicitationStyle::NativeControls,
+            },
+            message_id: "100".into(),
+            current_field: 0,
+            display_page: 0,
+            validation_error: None,
+            values: Map::new(),
+            outcome_tx: None,
+        }
+    }
+
+    #[test]
+    fn elicitation_render_neutralizes_mentions_and_urls() {
+        let state = test_elicitation_state(2);
+        let content = render_elicitation_content(&state, None);
+        assert!(content.contains("agent ＠everyone"));
+        assert!(content.contains("https[:]//example.com"));
+        assert!(!content.contains("@everyone"));
+        assert!(!content.contains("https://example.com"));
+    }
+
+    #[test]
+    fn elicitation_uses_select_for_safe_enum_and_text_for_large_enum() {
+        let native = test_elicitation_state(2);
+        assert!(matches!(
+            render_elicitation_components(&native, false).first(),
+            Some(CreateActionRow::SelectMenu(_))
+        ));
+        let mut fallback = test_elicitation_state(26);
+        fallback.presentation.style = ElicitationStyle::TextFallback;
+        assert!(
+            render_elicitation_content(&fallback, None).contains("Reply directly to this message")
+        );
+        assert!(!matches!(
+            render_elicitation_components(&fallback, false).first(),
+            Some(CreateActionRow::SelectMenu(_))
+        ));
+    }
+
+    #[test]
+    fn elicitation_pagination_reaches_long_text_and_last_choice_without_truncation() {
+        let mut state = test_elicitation_state(100);
+        state.presentation.style = ElicitationStyle::TextFallback;
+        state.presentation.message = format!(
+            "intro {} final-message-tail",
+            "supplementary 😀 and markdown **x** https://example.com ".repeat(80)
+        );
+        state.presentation.form.fields[0].description = Some(format!(
+            "field-description {} final-description-tail",
+            "details ".repeat(200)
+        ));
+
+        let full = current_full_elicitation_content(&state, None);
+        assert!(full.contains("final-message-tail"));
+        assert!(full.contains("final-description-tail"));
+        assert!(full.contains("100. choice-99 = `choice-99`"));
+        assert!(!full.contains("…"));
+
+        let pages = split_display_pages(&full, 1750);
+        assert!(pages.len() > 1);
+        for (i, _) in pages.iter().enumerate() {
+            state.display_page = i;
+            assert!(render_elicitation_content(&state, None).chars().count() <= 2000);
+        }
+    }
+
+    #[test]
+    fn elicitation_text_commands_choose_review_edit_and_submit_exact_values() {
+        let mut state = test_elicitation_state(100);
+        state.presentation.style = ElicitationStyle::TextFallback;
+        assert!(apply_text_reply(&mut state, "!form choose 100").is_none());
+        assert_eq!(
+            state.values.get("choice"),
+            Some(&serde_json::json!("choice-99"))
+        );
+        assert!(apply_text_reply(&mut state, "false").is_none());
+        assert_eq!(state.current_field, state.presentation.form.fields.len());
+        assert!(apply_text_reply(&mut state, "!form edit 1").is_none());
+        assert_eq!(state.current_field, 0);
+        assert!(apply_text_reply(&mut state, "!form choose 99").is_none());
+        assert_eq!(
+            state.values.get("choice"),
+            Some(&serde_json::json!("choice-98"))
+        );
+        let Some(ElicitationOutcome::Accept(values)) = apply_text_reply(&mut state, "!form submit")
+        else {
+            panic!("submit should accept valid values");
+        };
+        assert_eq!(values.get("choice"), Some(&serde_json::json!("choice-98")));
+    }
 
     // --- truncate_for_discord (select menu option 100-char cap) ---
 
@@ -3347,7 +4806,10 @@ mod tests {
         assert!(content.contains("12781.64 / 10000"));
         assert!(content.contains("Overage charges: 111.27 USD"));
         let json = serde_json::to_value(&embed).expect("embed serializes");
-        assert!(json.get("description").is_none(), "body must not be in embed");
+        assert!(
+            json.get("description").is_none(),
+            "body must not be in embed"
+        );
         assert!(json.get("title").is_none(), "title must not be in embed");
         assert_eq!(json["color"], 0xE74C3C, "over limit → red strip");
         assert_eq!(json["footer"]["text"], "Billing cycle resets 2026-08-01");
@@ -3409,7 +4871,10 @@ mod tests {
     #[test]
     fn truncate_utf16_respects_prefix_suffix_budget() {
         // limit 10, prefix "pre" (3) + suffix "su" (2) = 5 → 5 ASCII units left.
-        assert_eq!(truncate_to_utf16_budget("abcdefghij", "pre", "su", 10), "abcde");
+        assert_eq!(
+            truncate_to_utf16_budget("abcdefghij", "pre", "su", 10),
+            "abcde"
+        );
     }
 
     /// A supplementary-plane scalar counts as TWO UTF-16 code units, not one.
@@ -4302,9 +5767,8 @@ mod tests {
         trusted_bot_ids: &HashSet<u64>,
         author_id: u64,
     ) -> bool {
-        let trusted_mention = is_mentioned
-            && !trusted_bot_ids.is_empty()
-            && trusted_bot_ids.contains(&author_id);
+        let trusted_mention =
+            is_mentioned && !trusted_bot_ids.is_empty() && trusted_bot_ids.contains(&author_id);
 
         if !trusted_mention {
             match allow_bot_messages {
@@ -4337,7 +5801,12 @@ mod tests {
     #[test]
     fn bot_admission_untrusted_mention_blocked_by_off() {
         let trusted = HashSet::from([42]);
-        assert!(!should_admit_bot_message(AllowBots::Off, true, &trusted, 99));
+        assert!(!should_admit_bot_message(
+            AllowBots::Off,
+            true,
+            &trusted,
+            99
+        ));
     }
 
     /// GIVEN: allow_bot_messages=Off, trusted bot without @mention
@@ -4345,7 +5814,12 @@ mod tests {
     #[test]
     fn bot_admission_trusted_no_mention_blocked_by_off() {
         let trusted = HashSet::from([42]);
-        assert!(!should_admit_bot_message(AllowBots::Off, false, &trusted, 42));
+        assert!(!should_admit_bot_message(
+            AllowBots::Off,
+            false,
+            &trusted,
+            42
+        ));
     }
 
     /// GIVEN: allow_bot_messages=Off, empty trusted_bot_ids, bot @mentions
@@ -4353,7 +5827,12 @@ mod tests {
     #[test]
     fn bot_admission_empty_trusted_ids_off_mode() {
         let trusted: HashSet<u64> = HashSet::new();
-        assert!(!should_admit_bot_message(AllowBots::Off, true, &trusted, 42));
+        assert!(!should_admit_bot_message(
+            AllowBots::Off,
+            true,
+            &trusted,
+            42
+        ));
     }
 
     /// GIVEN: allow_bot_messages=Mentions, trusted bot @mentions
@@ -4361,7 +5840,12 @@ mod tests {
     #[test]
     fn bot_admission_mentions_mode_trusted_mention() {
         let trusted = HashSet::from([42]);
-        assert!(should_admit_bot_message(AllowBots::Mentions, true, &trusted, 42));
+        assert!(should_admit_bot_message(
+            AllowBots::Mentions,
+            true,
+            &trusted,
+            42
+        ));
     }
 
     /// GIVEN: allow_bot_messages=All, untrusted bot (not in trusted_bot_ids)
@@ -4369,7 +5853,12 @@ mod tests {
     #[test]
     fn bot_admission_all_mode_untrusted_bot_rejected() {
         let trusted = HashSet::from([42]);
-        assert!(!should_admit_bot_message(AllowBots::All, false, &trusted, 99));
+        assert!(!should_admit_bot_message(
+            AllowBots::All,
+            false,
+            &trusted,
+            99
+        ));
     }
 
     // --- DM gating tests (#656) ---
@@ -4459,19 +5948,28 @@ mod tests {
 
     #[test]
     fn dedup_detects_existing_bot_warning() {
-        let msg = format!("{} (20/20). A human must reply.", BOT_TURN_LIMIT_WARNING_PREFIX);
+        let msg = format!(
+            "{} (20/20). A human must reply.",
+            BOT_TURN_LIMIT_WARNING_PREFIX
+        );
         assert!(turn_limit_warning_present(&[(true, &msg)]));
     }
 
     #[test]
     fn dedup_ignores_human_warning_text() {
-        let msg = format!("{} (20/20). A human must reply.", BOT_TURN_LIMIT_WARNING_PREFIX);
+        let msg = format!(
+            "{} (20/20). A human must reply.",
+            BOT_TURN_LIMIT_WARNING_PREFIX
+        );
         assert!(!turn_limit_warning_present(&[(false, &msg)]));
     }
 
     #[test]
     fn dedup_returns_false_when_no_warning() {
-        assert!(!turn_limit_warning_present(&[(true, "hello"), (false, "world")]));
+        assert!(!turn_limit_warning_present(&[
+            (true, "hello"),
+            (false, "world")
+        ]));
     }
 
     #[test]
@@ -4488,7 +5986,10 @@ mod tests {
     fn reaction_mentions_mode_always_rejected() {
         assert!(!should_process_reaction(
             AllowUsers::Mentions,
-            true, true, false, false,
+            true,
+            true,
+            false,
+            false,
         ));
     }
 
@@ -4500,7 +6001,8 @@ mod tests {
             AllowUsers::Involved,
             false, // is_thread
             false, // bot_involved (irrelevant for non-thread)
-            false, false,
+            false,
+            false,
         ));
     }
 
@@ -4512,7 +6014,8 @@ mod tests {
             AllowUsers::Involved,
             true,  // is_thread
             false, // bot_involved
-            false, false,
+            false,
+            false,
         ));
     }
 
@@ -4524,7 +6027,8 @@ mod tests {
             AllowUsers::Involved,
             true, // is_thread
             true, // bot_involved
-            false, false,
+            false,
+            false,
         ));
     }
 
@@ -4574,7 +6078,9 @@ mod tests {
         assert!(!should_process_reaction(
             AllowUsers::MultibotMentions,
             false, // is_thread
-            false, false, false,
+            false,
+            false,
+            false,
         ));
     }
 }

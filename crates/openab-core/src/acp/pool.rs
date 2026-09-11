@@ -1,4 +1,7 @@
 use crate::acp::connection::{AcpConnection, SessionActivity};
+use crate::acp::elicitation::{
+    ConnectionGeneration, ElicitationCoordinator, ElicitationOutcome, FormPresenter,
+};
 use crate::acp::protocol::ConfigOption;
 use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
@@ -32,6 +35,10 @@ struct PoolState {
     facade_tokens: HashMap<String, String>,
     /// Lock-free activity handles for hung-session detection without the connection mutex.
     activity: HashMap<String, Arc<SessionActivity>>,
+    /// Whether the active connection was initialized with ACP form presentation.
+    form_capabilities: HashMap<String, bool>,
+    /// Lock-free elicitation handles for generation-scoped form invalidation.
+    elicitations: HashMap<String, (Arc<ElicitationCoordinator>, ConnectionGeneration)>,
     /// Child process-group ids, captured at insert time so hung eviction can
     /// kill the agent process without ever locking the connection.
     pgids: HashMap<String, i32>,
@@ -112,7 +119,12 @@ fn classify_hung(
 /// either resumes the session, so both are credentials. Extracted from the loop in `cleanup_idle`
 /// so the redaction can be exercised by a test for real — R1 redacted the sites it enumerated and
 /// this force-evict site was outside that list, logging both ids raw.
-fn warn_force_evicting_hung(key: &str, session_id: Option<&str>, age_secs: u64, threshold_secs: u64) {
+fn warn_force_evicting_hung(
+    key: &str,
+    session_id: Option<&str>,
+    age_secs: u64,
+    threshold_secs: u64,
+) {
     warn!(
         thread_id = %crate::redact::redact_session_ids(key),
         session_id = %session_id.map(crate::redact::redact_session_ids).unwrap_or_default(),
@@ -176,6 +188,7 @@ async fn setup_facade_session(
 fn purge_session_entries(state: &mut PoolState, key: &str) {
     state.cancel_handles.remove(key);
     state.activity.remove(key);
+    state.elicitations.remove(key);
     state.pgids.remove(key);
     state.suspended.remove(key);
     state.persisted.remove(key);
@@ -223,6 +236,13 @@ fn apply_hung_eviction(
 ) -> bool {
     if remove_if_same_handle(&mut state.active, key, expected).is_none() {
         return false;
+    }
+    if let Some((coordinator, generation)) = state.elicitations.get(key).cloned() {
+        tokio::spawn(async move {
+            coordinator
+                .expire_generation(generation, ElicitationOutcome::Cancel)
+                .await;
+        });
     }
     purge_session_entries(state, key);
     true
@@ -294,6 +314,8 @@ impl SessionPool {
                 #[cfg(feature = "acp-mcp")]
                 facade_tokens: HashMap::new(),
                 activity: HashMap::new(),
+                form_capabilities: HashMap::new(),
+                elicitations: HashMap::new(),
                 pgids: HashMap::new(),
                 persisted: suspended.clone(),
                 suspended,
@@ -397,6 +419,7 @@ impl SessionPool {
         &self,
         thread_id: &str,
         working_dir_override: Option<&str>,
+        form_presenter: Option<Arc<dyn FormPresenter>>,
     ) -> Result<bool> {
         let create_gate = {
             let mut state = self.state.write().await;
@@ -411,6 +434,19 @@ impl SessionPool {
                 state.suspended.get(thread_id).cloned(),
             )
         };
+
+        let requested_form_capability = form_presenter.is_some();
+        if let Some(existing_capability) = {
+            let state = self.state.read().await;
+            state.form_capabilities.get(thread_id).copied()
+        } {
+            if existing_capability != requested_form_capability {
+                return Err(anyhow!(
+                    "session capability mismatch for reused session {}",
+                    crate::redact::redact_session_ids(thread_id)
+                ));
+            }
+        }
 
         let had_existing = existing.is_some();
         let mut saved_session_id = saved_session_id;
@@ -540,12 +576,13 @@ impl SessionPool {
         };
         #[cfg(not(feature = "acp-mcp"))]
         let spawn_env = self.config.env.clone();
-        let mut new_conn = AcpConnection::spawn(
+        let mut new_conn = AcpConnection::spawn_with_elicitation(
             &self.config.command,
             &self.config.args,
             &effective_workdir,
             &spawn_env,
             &self.config.inherit_env,
+            form_presenter,
         )
         .await?;
 
@@ -612,6 +649,7 @@ impl SessionPool {
 
         let cancel_handle = new_conn.cancel_handle();
         let activity_handle = new_conn.activity_handle();
+        let elicitation_handle = new_conn.elicitation_handle();
         let child_pgid = new_conn.child_pgid();
         let cancel_session_id = new_conn.acp_session_id.clone().unwrap_or_default();
         #[cfg(feature = "acp-mcp")]
@@ -634,6 +672,8 @@ impl SessionPool {
             state.active.remove(thread_id);
             state.cancel_handles.remove(thread_id);
             state.activity.remove(thread_id);
+            state.form_capabilities.remove(thread_id);
+            state.elicitations.remove(thread_id);
             state.pgids.remove(thread_id);
         }
 
@@ -642,6 +682,14 @@ impl SessionPool {
                 if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
                     state.cancel_handles.remove(&key);
                     state.activity.remove(&key);
+                    state.form_capabilities.remove(&key);
+                    if let Some((coordinator, generation)) = state.elicitations.remove(&key) {
+                        tokio::spawn(async move {
+                            coordinator
+                                .expire_generation(generation, ElicitationOutcome::Cancel)
+                                .await;
+                        });
+                    }
                     state.pgids.remove(&key);
                     #[cfg(feature = "acp-mcp")]
                     revoke_facade_token_for_key(&mut state, &key, self.session_registrar.as_ref());
@@ -680,6 +728,12 @@ impl SessionPool {
         state
             .activity
             .insert(thread_id.to_string(), activity_handle);
+        state
+            .form_capabilities
+            .insert(thread_id.to_string(), requested_form_capability);
+        state
+            .elicitations
+            .insert(thread_id.to_string(), elicitation_handle);
         if let Some(pgid) = child_pgid {
             state.pgids.insert(thread_id.to_string(), pgid);
         }
@@ -692,7 +746,12 @@ impl SessionPool {
         // supersedes under the same key (its guard cannot fire if that predecessor is hung). F3.
         #[cfg(feature = "acp-mcp")]
         if let Some(token) = session_token {
-            install_facade_token(&mut state, thread_id, token, self.session_registrar.as_ref());
+            install_facade_token(
+                &mut state,
+                thread_id,
+                token,
+                self.session_registrar.as_ref(),
+            );
         }
         self.save_mapping(&state.persisted);
 
@@ -727,11 +786,12 @@ impl SessionPool {
     {
         let conn = {
             let state = self.state.read().await;
-            state
-                .active
-                .get(thread_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("no connection for thread {}", crate::redact::redact_session_ids(thread_id)))?
+            state.active.get(thread_id).cloned().ok_or_else(|| {
+                anyhow!(
+                    "no connection for thread {}",
+                    crate::redact::redact_session_ids(thread_id)
+                )
+            })?
         };
 
         let mut conn = conn.lock().await;
@@ -759,11 +819,12 @@ impl SessionPool {
     ) -> Result<Vec<ConfigOption>> {
         let conn = {
             let state = self.state.read().await;
-            state
-                .active
-                .get(thread_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("no connection for thread {}", crate::redact::redact_session_ids(thread_id)))?
+            state.active.get(thread_id).cloned().ok_or_else(|| {
+                anyhow!(
+                    "no connection for thread {}",
+                    crate::redact::redact_session_ids(thread_id)
+                )
+            })?
         };
         let mut conn = conn.lock().await;
         conn.set_config_option(config_id, value).await
@@ -775,11 +836,12 @@ impl SessionPool {
     pub async fn get_usage(&self, thread_id: &str) -> Result<crate::acp::protocol::UsageReport> {
         let conn = {
             let state = self.state.read().await;
-            state
-                .active
-                .get(thread_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("no connection for thread {}", crate::redact::redact_session_ids(thread_id)))?
+            state.active.get(thread_id).cloned().ok_or_else(|| {
+                anyhow!(
+                    "no connection for thread {}",
+                    crate::redact::redact_session_ids(thread_id)
+                )
+            })?
         };
         let mut conn = conn.lock().await;
         conn.get_usage().await
@@ -788,14 +850,30 @@ impl SessionPool {
     /// Cancel the current in-flight operation for a session.
     /// Uses pre-stored cancel handles to avoid locking the connection (which is held during streaming).
     pub async fn cancel_session(&self, thread_id: &str) -> Result<()> {
-        let (stdin, session_id) = {
+        let (stdin, session_id, elicitation_handle) = {
             let state = self.state.read().await;
-            state
-                .cancel_handles
-                .get(thread_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("no session for thread {}", crate::redact::redact_session_ids(thread_id)))?
+            let (stdin, session_id) =
+                state
+                    .cancel_handles
+                    .get(thread_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "no session for thread {}",
+                            crate::redact::redact_session_ids(thread_id)
+                        )
+                    })?;
+            (
+                stdin,
+                session_id,
+                state.elicitations.get(thread_id).cloned(),
+            )
         };
+        if let Some((coordinator, generation)) = elicitation_handle {
+            coordinator
+                .expire_generation(generation, ElicitationOutcome::Cancel)
+                .await;
+        }
         let data = serde_json::to_string(&serde_json::json!({
             "jsonrpc": "2.0",
             "method": "session/cancel",
@@ -836,6 +914,7 @@ impl SessionPool {
         }
 
         let mut state = self.state.write().await;
+        let elicitation_handle = state.elicitations.remove(thread_id);
         let had_active = state.active.remove(thread_id).is_some();
         // Everything else a reset clears is exactly what hung eviction clears, including the rule
         // that the creating gate survives. Call the one implementation rather than keeping a second
@@ -848,11 +927,20 @@ impl SessionPool {
         revoke_facade_token_for_key(&mut state, thread_id, self.session_registrar.as_ref());
         self.save_mapping(&state.persisted);
         self.save_meta(&state.session_workdirs);
+        drop(state);
+        if let Some((coordinator, generation)) = elicitation_handle {
+            coordinator
+                .expire_generation(generation, ElicitationOutcome::Cancel)
+                .await;
+        }
         if had_active {
             info!(thread_id = %crate::redact::redact_session_ids(thread_id), "session reset");
             Ok(())
         } else {
-            Err(anyhow!("no session for thread {}", crate::redact::redact_session_ids(thread_id)))
+            Err(anyhow!(
+                "no session for thread {}",
+                crate::redact::redact_session_ids(thread_id)
+            ))
         }
     }
 
@@ -953,6 +1041,13 @@ impl SessionPool {
                 info!(thread_id = %crate::redact::redact_session_ids(&key), "cleaning up idle session");
                 state.cancel_handles.remove(&key);
                 state.activity.remove(&key);
+                if let Some((coordinator, generation)) = state.elicitations.remove(&key) {
+                    tokio::spawn(async move {
+                        coordinator
+                            .expire_generation(generation, ElicitationOutcome::Cancel)
+                            .await;
+                    });
+                }
                 state.pgids.remove(&key);
                 #[cfg(feature = "acp-mcp")]
                 revoke_facade_token_for_key(&mut state, &key, self.session_registrar.as_ref());
@@ -1010,10 +1105,21 @@ impl SessionPool {
         }
         self.save_mapping(&state.persisted);
         let count = state.active.len();
+        let elicitation_handles: Vec<_> = state
+            .elicitations
+            .drain()
+            .map(|(_, handle)| handle)
+            .collect();
         state.active.clear();
         state.cancel_handles.clear();
         state.activity.clear();
         state.pgids.clear();
+        drop(state);
+        for (coordinator, generation) in elicitation_handles {
+            coordinator
+                .expire_generation(generation, ElicitationOutcome::Cancel)
+                .await;
+        }
         info!(count, "pool shutdown complete");
     }
 }
@@ -1064,6 +1170,8 @@ mod tests {
             cancel_handles: HashMap::new(),
             facade_tokens: HashMap::new(),
             activity: HashMap::new(),
+            form_capabilities: HashMap::new(),
+            elicitations: HashMap::new(),
             pgids: HashMap::new(),
             suspended: HashMap::new(),
             persisted: HashMap::new(),
@@ -1084,11 +1192,28 @@ mod tests {
         let mut state = empty_pool_state();
 
         // Predecessor registers, then a successor takes over the SAME key.
-        super::install_facade_token(&mut state, "discord:acp_x", "T_pred".into(), Some(&registrar));
-        assert!(reg.revoked().is_empty(), "nothing to revoke on the first install");
-        super::install_facade_token(&mut state, "discord:acp_x", "T_succ".into(), Some(&registrar));
+        super::install_facade_token(
+            &mut state,
+            "discord:acp_x",
+            "T_pred".into(),
+            Some(&registrar),
+        );
+        assert!(
+            reg.revoked().is_empty(),
+            "nothing to revoke on the first install"
+        );
+        super::install_facade_token(
+            &mut state,
+            "discord:acp_x",
+            "T_succ".into(),
+            Some(&registrar),
+        );
 
-        assert_eq!(reg.revoked(), vec!["T_pred"], "the predecessor token must be revoked");
+        assert_eq!(
+            reg.revoked(),
+            vec!["T_pred"],
+            "the predecessor token must be revoked"
+        );
         assert_eq!(
             state.facade_tokens.get("discord:acp_x").map(String::as_str),
             Some("T_succ"),
@@ -1105,14 +1230,25 @@ mod tests {
         let reg = Arc::new(CountingRegistrar::default());
         let registrar: Arc<dyn crate::acp_mcp::SessionTokenRegistrar> = reg.clone();
         let mut state = empty_pool_state();
-        state.facade_tokens.insert("discord:acp_x".into(), "T_hung".into());
+        state
+            .facade_tokens
+            .insert("discord:acp_x".into(), "T_hung".into());
         // A different session's token must be untouched.
-        state.facade_tokens.insert("discord:acp_y".into(), "T_other".into());
+        state
+            .facade_tokens
+            .insert("discord:acp_y".into(), "T_other".into());
 
         super::revoke_facade_token_for_key(&mut state, "discord:acp_x", Some(&registrar));
 
-        assert_eq!(reg.revoked(), vec!["T_hung"], "only the evicted session's token is revoked");
-        assert!(!state.facade_tokens.contains_key("discord:acp_x"), "and it is forgotten");
+        assert_eq!(
+            reg.revoked(),
+            vec!["T_hung"],
+            "only the evicted session's token is revoked"
+        );
+        assert!(
+            !state.facade_tokens.contains_key("discord:acp_x"),
+            "and it is forgotten"
+        );
         assert_eq!(
             state.facade_tokens.get("discord:acp_y").map(String::as_str),
             Some("T_other"),
@@ -1319,11 +1455,23 @@ mod tests {
         });
 
         let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        assert!(out.contains("force-evicting hung session"), "the warning must fire: {out}");
+        assert!(
+            out.contains("force-evicting hung session"),
+            "the warning must fire: {out}"
+        );
         assert!(!out.contains(uuid), "no raw uuid may reach the log: {out}");
-        assert!(!out.contains("acp_") && !out.contains("sess_"), "no raw id prefix either: {out}");
-        assert!(out.contains('#'), "the redaction tag must be present: {out}");
-        assert!(out.contains("discord"), "the readable platform half must survive: {out}");
+        assert!(
+            !out.contains("acp_") && !out.contains("sess_"),
+            "no raw id prefix either: {out}"
+        );
+        assert!(
+            out.contains('#'),
+            "the redaction tag must be present: {out}"
+        );
+        assert!(
+            out.contains("discord"),
+            "the readable platform half must survive: {out}"
+        );
     }
 
     #[test]
@@ -1337,6 +1485,8 @@ mod tests {
                 ("hung".to_string(), Arc::new(SessionActivity::new())),
                 ("other".to_string(), Arc::new(SessionActivity::new())),
             ]),
+            form_capabilities: HashMap::new(),
+            elicitations: HashMap::new(),
             pgids: HashMap::from([("hung".to_string(), 1234), ("other".to_string(), 5678)]),
             suspended: HashMap::from([
                 ("hung".to_string(), "session-hung".to_string()),
