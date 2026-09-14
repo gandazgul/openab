@@ -824,7 +824,13 @@ impl AdapterRouter {
                             "…".to_string()
                         };
                         let msg = if adapter.show_streaming_placeholder() {
-                            adapter.send_message(&thread_channel, &initial).await?
+                            match adapter.send_message(&thread_channel, &initial).await {
+                                Ok(msg) => msg,
+                                Err(err) => {
+                                    conn.abandon_request(request_id).await;
+                                    return Err(err);
+                                }
+                            }
                         } else {
                             // Dummy ref for edit loop — gateway uses drafts, doesn't need real msg_id
                             MessageRef {

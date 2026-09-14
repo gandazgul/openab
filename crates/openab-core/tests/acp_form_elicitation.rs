@@ -4,7 +4,10 @@ use openab_core::acp::elicitation::{
     ElicitationOutcome, ElicitationPresentation, ElicitationStatus, FormPresenter,
 };
 use openab_core::acp::ContentBlock;
-use openab_core::adapter::{ChannelRef, MessageRef};
+use openab_core::acp::SessionPool;
+use openab_core::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageContext, MessageRef};
+use openab_core::config::{AgentConfig, ReactionsConfig};
+use openab_core::markdown::TableMode;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
@@ -52,6 +55,85 @@ fn trigger_message() -> MessageRef {
     MessageRef {
         channel: channel(),
         message_id: "99".into(),
+    }
+}
+
+struct TestAdapter {
+    presenter: Arc<dyn FormPresenter>,
+    sent_tx: mpsc::UnboundedSender<String>,
+}
+
+#[async_trait]
+impl ChatAdapter for TestAdapter {
+    fn platform(&self) -> &'static str {
+        "discord"
+    }
+
+    fn message_limit(&self) -> usize {
+        2000
+    }
+
+    fn form_presenter(&self) -> Option<Arc<dyn FormPresenter>> {
+        Some(self.presenter.clone())
+    }
+
+    async fn send_message(
+        &self,
+        channel: &ChannelRef,
+        content: &str,
+    ) -> anyhow::Result<MessageRef> {
+        let _ = self.sent_tx.send(content.to_string());
+        Ok(MessageRef {
+            channel: channel.clone(),
+            message_id: "sent".to_string(),
+        })
+    }
+
+    async fn create_thread(
+        &self,
+        channel: &ChannelRef,
+        _trigger_msg: &MessageRef,
+        _title: &str,
+    ) -> anyhow::Result<ChannelRef> {
+        Ok(channel.clone())
+    }
+
+    async fn add_reaction(&self, _msg: &MessageRef, _emoji: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn remove_reaction(&self, _msg: &MessageRef, _emoji: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn use_streaming(&self, _other_bot_present: bool) -> bool {
+        false
+    }
+}
+
+fn fake_agent_config(scenario: &str) -> anyhow::Result<AgentConfig> {
+    let exe = std::env::current_exe()?;
+    let mut env = HashMap::new();
+    env.insert("OPENAB_FAKE_AGENT".to_string(), "1".to_string());
+    env.insert("OPENAB_FAKE_SCENARIO".to_string(), scenario.to_string());
+    Ok(AgentConfig {
+        command: exe.to_string_lossy().to_string(),
+        args: vec![
+            "--exact".to_string(),
+            "fake_agent_entry".to_string(),
+            "--nocapture".to_string(),
+        ],
+        working_dir: ".".to_string(),
+        env,
+        inherit_env: vec![],
+        command_explicit: true,
+    })
+}
+
+fn test_reactions_config() -> ReactionsConfig {
+    ReactionsConfig {
+        enabled: false,
+        ..Default::default()
     }
 }
 
@@ -108,6 +190,20 @@ async fn fake_runtime_observes_discord_form_capability_and_completes_prompt() {
     assert!(presentation.authorized_user_ids.contains("user-a"));
     assert_eq!(presentation.form.fields.len(), 2);
 
+    let pending = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.method.as_deref(), Some("session/update"));
+    assert_eq!(
+        pending
+            .params
+            .as_ref()
+            .and_then(|p| p.pointer("/update/content/text"))
+            .and_then(Value::as_str),
+        Some("pending")
+    );
+
     let mut content = presentation.form.default_content();
     content.insert("strategy".into(), json!("balanced"));
     content.insert("confirm".into(), json!(true));
@@ -115,15 +211,11 @@ async fn fake_runtime_observes_discord_form_capability_and_completes_prompt() {
         .send(ElicitationOutcome::Accept(content))
         .unwrap();
 
-    let mut saw_text = false;
     loop {
         let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
             .unwrap()
             .unwrap();
-        if msg.method.as_deref() == Some("session/update") {
-            saw_text = true;
-        }
         if msg
             .id
             .as_ref()
@@ -140,8 +232,63 @@ async fn fake_runtime_observes_discord_form_capability_and_completes_prompt() {
             break;
         }
     }
-    assert!(saw_text);
     assert_eq!(expired_rx.recv().await, Some(ElicitationStatus::Submitted));
+    conn.prompt_done().await;
+}
+
+#[tokio::test]
+async fn cancel_response_keeps_string_request_id_on_wire() {
+    let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+    let (outcome_tx, outcome_rx) = mpsc::unbounded_channel();
+    let (expired_tx, mut expired_rx) = mpsc::unbounded_channel();
+    let presenter = Arc::new(RecordingPresenter {
+        seen_tx,
+        outcome_rx: Arc::new(Mutex::new(outcome_rx)),
+        expired_tx,
+    });
+
+    let mut conn = spawn_fake("cancel_string_id", Some(presenter))
+        .await
+        .unwrap();
+    conn.initialize().await.unwrap();
+    conn.session_new(".").await.unwrap();
+    let (mut rx, request_id) = conn
+        .session_prompt(
+            vec![ContentBlock::Text {
+                text: "hello".into(),
+            }],
+            channel(),
+            trigger_message(),
+            HashSet::from(["user-a".to_string()]),
+        )
+        .await
+        .unwrap();
+
+    let presentation = tokio::time::timeout(std::time::Duration::from_secs(2), seen_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        presentation.agent_request_id,
+        openab_core::acp::protocol::JsonRpcId::String(ref id) if id == "elicitation-a"
+    ));
+    outcome_tx.send(ElicitationOutcome::Cancel).unwrap();
+
+    loop {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if msg
+            .id
+            .as_ref()
+            .and_then(openab_core::acp::protocol::JsonRpcId::as_u64)
+            == Some(request_id)
+        {
+            break;
+        }
+    }
+    assert_eq!(expired_rx.recv().await, Some(ElicitationStatus::Cancelled));
     conn.prompt_done().await;
 }
 
@@ -149,6 +296,223 @@ async fn fake_runtime_observes_discord_form_capability_and_completes_prompt() {
 async fn unsupported_sessions_do_not_advertise_elicitation() {
     let mut conn = spawn_fake("no_capability", None).await.unwrap();
     conn.initialize().await.unwrap();
+}
+
+#[tokio::test]
+async fn abandon_request_invalidates_pending_elicitation() {
+    let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+    let (_outcome_tx, outcome_rx) = mpsc::unbounded_channel();
+    let (expired_tx, mut expired_rx) = mpsc::unbounded_channel();
+    let presenter = Arc::new(RecordingPresenter {
+        seen_tx,
+        outcome_rx: Arc::new(Mutex::new(outcome_rx)),
+        expired_tx,
+    });
+
+    let mut conn = spawn_fake("accept_collision", Some(presenter))
+        .await
+        .unwrap();
+    conn.initialize().await.unwrap();
+    conn.session_new(".").await.unwrap();
+    let (_rx, request_id) = conn
+        .session_prompt(
+            vec![ContentBlock::Text {
+                text: "hello".into(),
+            }],
+            channel(),
+            trigger_message(),
+            HashSet::from(["user-a".to_string()]),
+        )
+        .await
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), seen_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    conn.abandon_request(request_id).await;
+    assert_eq!(expired_rx.recv().await, Some(ElicitationStatus::Cancelled));
+    assert_eq!(conn.pending_elicitations().await, 0);
+}
+
+#[tokio::test]
+async fn prompt_deadline_cleanup_invalidates_pending_elicitation() {
+    let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+    let (_outcome_tx, outcome_rx) = mpsc::unbounded_channel();
+    let (expired_tx, mut expired_rx) = mpsc::unbounded_channel();
+    let presenter = Arc::new(RecordingPresenter {
+        seen_tx,
+        outcome_rx: Arc::new(Mutex::new(outcome_rx)),
+        expired_tx,
+    });
+    let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
+    let adapter: Arc<dyn ChatAdapter> = Arc::new(TestAdapter { presenter, sent_tx });
+    let pool = Arc::new(SessionPool::new(
+        fake_agent_config("deadline_hang").unwrap(),
+        1,
+        30,
+        HashMap::new(),
+    ));
+    let router = AdapterRouter::new(
+        pool.clone(),
+        test_reactions_config(),
+        TableMode::Off,
+        1,
+        1,
+        HashMap::new(),
+        std::path::PathBuf::from("."),
+    );
+
+    router
+        .handle_message(
+            &adapter,
+            MessageContext {
+                thread_channel: channel(),
+                sender_json: json!({"sender_id":"user-a"}).to_string(),
+                prompt: "hello".to_string(),
+                extra_blocks: vec![],
+                trigger_msg: trigger_message(),
+                other_bot_present: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), seen_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(expired_rx.recv().await, Some(ElicitationStatus::Cancelled));
+    let warning = tokio::time::timeout(std::time::Duration::from_secs(2), sent_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(warning.contains("Agent exceeded hard timeout"));
+    let pending = pool
+        .with_connection("discord:10", |conn| {
+            Box::pin(async move { Ok(conn.pending_elicitations().await) })
+        })
+        .await
+        .unwrap();
+    assert_eq!(pending, 0);
+}
+
+async fn pool_with_pending_elicitation(
+    scenario: &str,
+) -> (
+    Arc<SessionPool>,
+    mpsc::UnboundedReceiver<ElicitationPresentation>,
+    mpsc::UnboundedReceiver<ElicitationStatus>,
+    mpsc::UnboundedSender<ElicitationOutcome>,
+) {
+    let (seen_tx, seen_rx) = mpsc::unbounded_channel();
+    let (outcome_tx, outcome_rx) = mpsc::unbounded_channel();
+    let (expired_tx, expired_rx) = mpsc::unbounded_channel();
+    let presenter = Arc::new(RecordingPresenter {
+        seen_tx,
+        outcome_rx: Arc::new(Mutex::new(outcome_rx)),
+        expired_tx,
+    });
+    let pool = Arc::new(SessionPool::new(
+        fake_agent_config(scenario).unwrap(),
+        1,
+        30,
+        HashMap::new(),
+    ));
+    pool.get_or_create("discord:10", None, Some(presenter))
+        .await
+        .unwrap();
+    pool.with_connection("discord:10", |conn| {
+        Box::pin(async move {
+            conn.session_prompt(
+                vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+                channel(),
+                trigger_message(),
+                HashSet::from(["user-a".to_string()]),
+            )
+            .await
+            .map(|_| ())
+        })
+    })
+    .await
+    .unwrap();
+    (pool, seen_rx, expired_rx, outcome_tx)
+}
+
+#[tokio::test]
+async fn reset_session_invalidates_pending_elicitation() {
+    let (pool, mut seen_rx, mut expired_rx, _outcome_tx) =
+        pool_with_pending_elicitation("deadline_cancel").await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), seen_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    pool.reset_session("discord:10").await.unwrap();
+    assert_eq!(expired_rx.recv().await, Some(ElicitationStatus::Cancelled));
+}
+
+#[tokio::test]
+async fn idle_eviction_invalidates_pending_elicitation() {
+    let (pool, mut seen_rx, mut expired_rx, _outcome_tx) =
+        pool_with_pending_elicitation("deadline_cancel").await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), seen_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    pool.with_connection("discord:10", |conn| {
+        Box::pin(async move {
+            conn.last_active = tokio::time::Instant::now() - std::time::Duration::from_secs(1);
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+    pool.cleanup_idle(0).await;
+    assert_eq!(expired_rx.recv().await, Some(ElicitationStatus::Cancelled));
+}
+
+#[tokio::test]
+async fn agent_eof_invalidates_pending_elicitation() {
+    let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+    let (_outcome_tx, outcome_rx) = mpsc::unbounded_channel();
+    let (expired_tx, mut expired_rx) = mpsc::unbounded_channel();
+    let presenter = Arc::new(RecordingPresenter {
+        seen_tx,
+        outcome_rx: Arc::new(Mutex::new(outcome_rx)),
+        expired_tx,
+    });
+
+    let mut conn = spawn_fake("eof_pending", Some(presenter)).await.unwrap();
+    conn.initialize().await.unwrap();
+    conn.session_new(".").await.unwrap();
+    let (mut rx, _request_id) = conn
+        .session_prompt(
+            vec![ContentBlock::Text {
+                text: "hello".into(),
+            }],
+            channel(),
+            trigger_message(),
+            HashSet::from(["user-a".to_string()]),
+        )
+        .await
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), seen_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(expired_rx.recv().await, Some(ElicitationStatus::Cancelled));
+    assert_eq!(conn.pending_elicitations().await, 0);
 }
 
 #[tokio::test]
@@ -227,12 +591,12 @@ fn run_fake_agent(scenario: &str) {
         init.get("method").and_then(Value::as_str),
         Some("initialize")
     );
-    let has_form = init
-        .pointer("/params/clientCapabilities/elicitation/form")
-        .is_some();
+    let client_capabilities = init
+        .pointer("/params/clientCapabilities")
+        .expect("initialize must include clientCapabilities");
     match scenario {
-        "no_capability" => assert!(!has_form),
-        _ => assert!(has_form),
+        "no_capability" => assert_eq!(client_capabilities, &json!({})),
+        _ => assert_eq!(client_capabilities, &json!({"elicitation": {"form": {}}})),
     }
     respond(
         &mut out,
@@ -268,10 +632,40 @@ fn run_fake_agent(scenario: &str) {
     match scenario {
         "accept_collision" => {
             request_elicitation(&mut out, prompt_id.clone(), mixed_schema());
+            notify(
+                &mut out,
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {"sessionId":"sess-test","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"pending"}}}
+                }),
+            );
             let result = read_json(&mut lines);
             assert_eq!(result["id"], prompt_id);
             assert_eq!(result["result"]["action"], "accept");
             assert_eq!(result["result"]["content"]["strategy"], "balanced");
+        }
+        "cancel_string_id" => {
+            request_elicitation(&mut out, json!("elicitation-a"), small_schema());
+            let result = read_json(&mut lines);
+            assert_eq!(result["id"], "elicitation-a");
+            assert_eq!(result["result"]["action"], "cancel");
+        }
+        "eof_pending" => {
+            request_elicitation(&mut out, json!(910), small_schema());
+            return;
+        }
+        "deadline_cancel" => {
+            request_elicitation(&mut out, json!(911), small_schema());
+            let result = read_json(&mut lines);
+            assert_eq!(result["id"], 911);
+            assert_eq!(result["result"]["action"], "cancel");
+            return;
+        }
+        "deadline_hang" => {
+            request_elicitation(&mut out, json!(912), small_schema());
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            return;
         }
         "overload" => {
             request_elicitation(&mut out, json!(900), small_schema());

@@ -1403,6 +1403,7 @@ mod tests {
         block_count: usize,
         other_bot_present: bool,
         dispatch_channel: ChannelRef,
+        authorized_user_ids: HashSet<String>,
     }
 
     /// Mock `DispatchTarget` — records calls; never touches a real session pool.
@@ -1465,7 +1466,7 @@ mod tests {
             content_blocks: Vec<ContentBlock>,
             thread_channel: &ChannelRef,
             _trigger_msg: MessageRef,
-            _authorized_user_ids: HashSet<String>,
+            authorized_user_ids: HashSet<String>,
             _reactions: Arc<StatusReactionController>,
             other_bot_present: bool,
             _recipient: Option<(String, String)>,
@@ -1474,6 +1475,7 @@ mod tests {
                 block_count: content_blocks.len(),
                 other_bot_present,
                 dispatch_channel: thread_channel.clone(),
+                authorized_user_ids,
             });
             if let Some(msg) = self.stream_err.lock().unwrap().take() {
                 return Err(anyhow::anyhow!(msg));
@@ -1606,6 +1608,27 @@ mod tests {
         assert_eq!(calls.len(), 1, "expected a single batched dispatch");
         // 3 arrivals × (delimiter + prompt) = 6 blocks.
         assert_eq!(calls[0].block_count, 6);
+    }
+
+    #[tokio::test]
+    async fn consumer_dispatch_authorizes_exact_human_senders_in_batch() {
+        let mut alice = make_msg("a", 50);
+        alice.sender_id = "alice".into();
+        alice.sender_name = "Alice".into();
+        let mut bot = make_msg("bot", 50);
+        bot.sender_id = "bot-1".into();
+        bot.sender_is_bot = true;
+        let mut bob = make_msg("b", 50);
+        bob.sender_id = "bob".into();
+        bob.sender_name = "Bob".into();
+
+        let calls = run_consumer_with_messages(vec![alice, bot, bob], 10, 24_000).await;
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].authorized_user_ids,
+            HashSet::from(["alice".to_string(), "bob".to_string()])
+        );
     }
 
     #[tokio::test]

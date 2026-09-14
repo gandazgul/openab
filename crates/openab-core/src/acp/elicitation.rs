@@ -6,6 +6,7 @@ use serde_json::{json, Map, Number, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use tokio::sync::{oneshot, Mutex};
 
 pub const MAX_ELICITATION_BYTES: usize = 64 * 1024;
@@ -14,6 +15,7 @@ pub const MAX_FIELD_CHOICES: usize = 100;
 pub const MAX_ACP_FRAME_BYTES: usize = 1024 * 1024;
 
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_TURN_AUTHORITY: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnectionGeneration(u64);
@@ -36,6 +38,7 @@ impl Default for ConnectionGeneration {
 
 #[derive(Debug, Clone)]
 pub struct ElicitationTurnContext {
+    pub authority_id: u64,
     pub session_id: Option<String>,
     pub request_id: Option<u64>,
     pub channel: ChannelRef,
@@ -251,26 +254,55 @@ impl FormField {
             .map(ToOwned::to_owned);
         let kind = match field_type {
             "string" => {
-                let choices = parse_choices(obj.get("enum"), name)?;
+                let choices = parse_choices(obj, name)?;
                 if choices.is_empty() {
+                    let min_length = optional_usize(obj, "minLength", name)?;
+                    let max_length = optional_usize(obj, "maxLength", name)?;
+                    if let (Some(min), Some(max)) = (min_length, max_length) {
+                        if min > max {
+                            return Err(ElicitationError::invalid_params(format!(
+                                "field `{name}` minLength cannot exceed maxLength"
+                            )));
+                        }
+                    }
+                    let format = optional_string(obj, "format", name)?;
+                    if let Some(format) = format.as_deref() {
+                        validate_known_format(name, format)?;
+                    }
                     FormFieldKind::String {
-                        min_length: optional_usize(obj, "minLength", name)?,
-                        max_length: optional_usize(obj, "maxLength", name)?,
+                        min_length,
+                        max_length,
                         pattern: optional_regex(obj, "pattern", name)?,
-                        format: optional_string(obj, "format", name)?,
+                        format,
                     }
                 } else {
                     FormFieldKind::SingleSelect { choices }
                 }
             }
-            "number" => FormFieldKind::Number {
-                minimum: optional_f64(obj, "minimum", name)?,
-                maximum: optional_f64(obj, "maximum", name)?,
-            },
-            "integer" => FormFieldKind::Integer {
-                minimum: optional_i64(obj, "minimum", name)?,
-                maximum: optional_i64(obj, "maximum", name)?,
-            },
+            "number" => {
+                let minimum = optional_f64(obj, "minimum", name)?;
+                let maximum = optional_f64(obj, "maximum", name)?;
+                if let (Some(min), Some(max)) = (minimum, maximum) {
+                    if min > max {
+                        return Err(ElicitationError::invalid_params(format!(
+                            "field `{name}` minimum cannot exceed maximum"
+                        )));
+                    }
+                }
+                FormFieldKind::Number { minimum, maximum }
+            }
+            "integer" => {
+                let minimum = optional_i64(obj, "minimum", name)?;
+                let maximum = optional_i64(obj, "maximum", name)?;
+                if let (Some(min), Some(max)) = (minimum, maximum) {
+                    if min > max {
+                        return Err(ElicitationError::invalid_params(format!(
+                            "field `{name}` minimum cannot exceed maximum"
+                        )));
+                    }
+                }
+                FormFieldKind::Integer { minimum, maximum }
+            }
             "boolean" => FormFieldKind::Boolean,
             "array" => parse_array_kind(name, obj)?,
             other => {
@@ -488,7 +520,13 @@ impl FormField {
                                 .is_some_and(|s| s.chars().count() > 100)
                     })
             }
-            _ => false,
+            FormFieldKind::String { .. }
+            | FormFieldKind::Number { .. }
+            | FormFieldKind::Integer { .. }
+            | FormFieldKind::Boolean => self
+                .default
+                .as_ref()
+                .is_some_and(|value| value.to_string().encode_utf16().count() > 4000),
         }
     }
 
@@ -680,6 +718,7 @@ struct PendingElicitation {
     nonce: String,
     channel: ChannelRef,
     trigger_message: MessageRef,
+    presentation_message_id: Option<String>,
     authorized_user_ids: HashSet<String>,
     sender: Option<oneshot::Sender<ElicitationOutcome>>,
 }
@@ -687,6 +726,8 @@ struct PendingElicitation {
 #[derive(Default)]
 pub struct ElicitationCoordinator {
     state: Mutex<CoordinatorState>,
+    revoked: StdMutex<HashSet<ConnectionGeneration>>,
+    active_turns: StdMutex<HashMap<ConnectionGeneration, u64>>,
 }
 
 impl std::fmt::Debug for ElicitationCoordinator {
@@ -701,6 +742,45 @@ impl ElicitationCoordinator {
         Arc::new(Self::default())
     }
 
+    pub fn revoke_generation(&self, generation: ConnectionGeneration) {
+        self.active_turns
+            .lock()
+            .expect("elicitation active turns lock poisoned")
+            .remove(&generation);
+        self.revoked
+            .lock()
+            .expect("elicitation revoked lock poisoned")
+            .insert(generation);
+    }
+
+    pub fn open_generation_turn(&self, generation: ConnectionGeneration) -> u64 {
+        let authority_id = NEXT_TURN_AUTHORITY.fetch_add(1, Ordering::Relaxed);
+        self.revoked
+            .lock()
+            .expect("elicitation revoked lock poisoned")
+            .remove(&generation);
+        self.active_turns
+            .lock()
+            .expect("elicitation active turns lock poisoned")
+            .insert(generation, authority_id);
+        authority_id
+    }
+
+    fn is_active_turn(&self, generation: ConnectionGeneration, authority_id: u64) -> bool {
+        self.active_turns
+            .lock()
+            .expect("elicitation active turns lock poisoned")
+            .get(&generation)
+            .is_some_and(|active| *active == authority_id)
+    }
+
+    fn is_revoked(&self, generation: ConnectionGeneration) -> bool {
+        self.revoked
+            .lock()
+            .expect("elicitation revoked lock poisoned")
+            .contains(&generation)
+    }
+
     pub async fn start(
         self: &Arc<Self>,
         generation: ConnectionGeneration,
@@ -710,10 +790,13 @@ impl ElicitationCoordinator {
         turn: Option<&ElicitationTurnContext>,
         agent_name: &str,
     ) -> ElicitationStart {
+        if self.is_revoked(generation) {
+            return ElicitationStart::Immediate(ElicitationOutcome::Cancel);
+        }
         let Some(turn) = turn else {
             return ElicitationStart::Immediate(ElicitationOutcome::Cancel);
         };
-        if !turn.has_human_authority() {
+        if !turn.has_human_authority() || !self.is_active_turn(generation, turn.authority_id) {
             return ElicitationStart::Immediate(ElicitationOutcome::Cancel);
         }
         let create = match ElicitationCreate::parse(
@@ -727,6 +810,9 @@ impl ElicitationCoordinator {
         };
 
         let mut state = self.state.lock().await;
+        if self.is_revoked(generation) || !self.is_active_turn(generation, turn.authority_id) {
+            return ElicitationStart::Immediate(ElicitationOutcome::Cancel);
+        }
         if state.pending.contains_key(&generation) {
             return ElicitationStart::Error(ElicitationError::busy());
         }
@@ -759,6 +845,7 @@ impl ElicitationCoordinator {
                 nonce,
                 channel: turn.channel.clone(),
                 trigger_message: turn.trigger_message.clone(),
+                presentation_message_id: None,
                 authorized_user_ids: turn.authorized_user_ids.clone(),
                 sender: Some(sender),
             },
@@ -778,6 +865,11 @@ impl ElicitationCoordinator {
         reply_to_message_id: Option<&str>,
         outcome: ElicitationOutcome,
     ) -> std::result::Result<(), ElicitationError> {
+        if self.is_revoked(generation) {
+            return Err(ElicitationError::invalid_params(
+                "elicitation is no longer pending",
+            ));
+        }
         let mut state = self.state.lock().await;
         let pending = state
             .pending
@@ -797,34 +889,95 @@ impl ElicitationCoordinator {
             ));
         }
         if let Some(reply_to_message_id) = reply_to_message_id {
-            if pending.trigger_message.message_id != reply_to_message_id {
+            let matches_trigger = pending.trigger_message.message_id == reply_to_message_id;
+            let matches_form = pending
+                .presentation_message_id
+                .as_deref()
+                .is_some_and(|message_id| message_id == reply_to_message_id);
+            if !matches_trigger && !matches_form {
                 return Err(ElicitationError::invalid_params(
                     "text reply does not target this elicitation",
                 ));
             }
         }
-        let pending = state.pending.remove(&generation).expect("pending exists");
-        if let Some(sender) = pending.sender {
-            let _ = sender.send(outcome);
-        }
+        let Some(sender) = pending.sender.take() else {
+            return Err(ElicitationError::invalid_params(
+                "elicitation is already resolved",
+            ));
+        };
+        let _ = sender.send(outcome);
         Ok(())
     }
 
-    pub async fn complete_generation(&self, generation: ConnectionGeneration) -> bool {
+    pub async fn bind_message_id(
+        &self,
+        generation: ConnectionGeneration,
+        nonce: &str,
+        channel: &ChannelRef,
+        message_id: String,
+    ) -> bool {
+        if self.is_revoked(generation) {
+            return false;
+        }
         let mut state = self.state.lock().await;
         let Some(pending) = state.pending.get_mut(&generation) else {
             return false;
         };
+        if pending.nonce != nonce || &pending.channel != channel || pending.sender.is_none() {
+            return false;
+        }
+        pending.presentation_message_id = Some(message_id);
+        true
+    }
+
+    pub async fn complete_generation(&self, generation: ConnectionGeneration, nonce: &str) -> bool {
+        if self.is_revoked(generation) {
+            return false;
+        }
+        let mut state = self.state.lock().await;
+        let Some(pending) = state.pending.get_mut(&generation) else {
+            return false;
+        };
+        if pending.nonce != nonce {
+            return false;
+        }
         pending.sender.take().is_some()
     }
 
-    pub async fn finish_generation(&self, generation: ConnectionGeneration) -> bool {
-        self.state
-            .lock()
-            .await
+    pub async fn expire_generation_nonce(
+        &self,
+        generation: ConnectionGeneration,
+        nonce: &str,
+        outcome: ElicitationOutcome,
+    ) -> bool {
+        let mut state = self.state.lock().await;
+        let Some(pending) = state.pending.get(&generation) else {
+            return false;
+        };
+        if pending.nonce != nonce {
+            return false;
+        }
+        let Some(mut pending) = state.pending.remove(&generation) else {
+            return false;
+        };
+        if let Some(sender) = pending.sender.take() {
+            let _ = sender.send(outcome);
+        }
+        true
+    }
+
+    pub async fn finish_generation(&self, generation: ConnectionGeneration, nonce: &str) -> bool {
+        let mut state = self.state.lock().await;
+        if state
             .pending
-            .remove(&generation)
-            .is_some()
+            .get(&generation)
+            .is_some_and(|pending| pending.nonce == nonce)
+        {
+            state.pending.remove(&generation);
+            true
+        } else {
+            false
+        }
     }
 
     pub async fn expire_generation(
@@ -832,6 +985,7 @@ impl ElicitationCoordinator {
         generation: ConnectionGeneration,
         outcome: ElicitationOutcome,
     ) -> bool {
+        self.revoke_generation(generation);
         let mut state = self.state.lock().await;
         let Some(mut pending) = state.pending.remove(&generation) else {
             return false;
@@ -846,7 +1000,8 @@ impl ElicitationCoordinator {
         let mut state = self.state.lock().await;
         let pending = std::mem::take(&mut state.pending);
         let count = pending.len();
-        for (_, mut item) in pending {
+        for (generation, mut item) in pending {
+            self.revoke_generation(generation);
             if let Some(sender) = item.sender.take() {
                 let _ = sender.send(ElicitationOutcome::Cancel);
             }
@@ -865,10 +1020,14 @@ impl ElicitationCoordinator {
         user_id: &str,
         channel: &ChannelRef,
     ) -> bool {
+        if self.is_revoked(generation) {
+            return false;
+        }
         let state = self.state.lock().await;
         state.pending.get(&generation).is_some_and(|pending| {
             pending.nonce == nonce
                 && &pending.channel == channel
+                && pending.sender.is_some()
                 && pending.authorized_user_ids.contains(user_id)
         })
     }
@@ -1002,45 +1161,78 @@ fn parse_array_kind(
     let items = obj.get("items").and_then(Value::as_object).ok_or_else(|| {
         ElicitationError::invalid_params(format!("field `{name}` array items must be an object"))
     })?;
-    if items.get("type").and_then(Value::as_str) != Some("string") {
+    let choices = parse_choices(items, name)?;
+    if items
+        .get("type")
+        .is_some_and(|item_type| item_type.as_str() != Some("string"))
+    {
         return Err(ElicitationError::invalid_params(format!(
             "field `{name}` only supports string array items"
         )));
     }
-    let choices = parse_choices(items.get("enum"), name)?;
     if choices.is_empty() {
         return Err(ElicitationError::invalid_params(format!(
             "field `{name}` array must declare string enum choices"
         )));
     }
+    let min_items = optional_usize(obj, "minItems", name)?;
+    let max_items = optional_usize(obj, "maxItems", name)?;
+    if let (Some(min), Some(max)) = (min_items, max_items) {
+        if min > max {
+            return Err(ElicitationError::invalid_params(format!(
+                "field `{name}` minItems cannot exceed maxItems"
+            )));
+        }
+    }
     Ok(FormFieldKind::MultiSelect {
         choices,
-        min_items: optional_usize(obj, "minItems", name)?,
-        max_items: optional_usize(obj, "maxItems", name)?,
+        min_items,
+        max_items,
     })
 }
 
 fn parse_choices(
-    enum_value: Option<&Value>,
+    obj: &Map<String, Value>,
     field_name: &str,
 ) -> std::result::Result<Vec<FormChoice>, ElicitationError> {
-    let Some(enum_value) = enum_value else {
+    let source = if let Some(enum_value) = obj.get("enum") {
+        let values = enum_value.as_array().ok_or_else(|| {
+            ElicitationError::invalid_params(format!("field `{field_name}` enum must be an array"))
+        })?;
+        if values.is_empty() {
+            return Err(ElicitationError::invalid_params(format!(
+                "field `{field_name}` enum must not be empty"
+            )));
+        }
+        ChoiceSource::Enum(values)
+    } else if let Some(one_of) = obj.get("oneOf") {
+        ChoiceSource::ConstList(one_of.as_array().ok_or_else(|| {
+            ElicitationError::invalid_params(format!("field `{field_name}` oneOf must be an array"))
+        })?)
+    } else if let Some(any_of) = obj.get("anyOf") {
+        ChoiceSource::ConstList(any_of.as_array().ok_or_else(|| {
+            ElicitationError::invalid_params(format!("field `{field_name}` anyOf must be an array"))
+        })?)
+    } else {
         return Ok(Vec::new());
     };
-    let values = enum_value.as_array().ok_or_else(|| {
-        ElicitationError::invalid_params(format!("field `{field_name}` enum must be an array"))
-    })?;
-    if values.len() > MAX_FIELD_CHOICES {
+    let len = source.len();
+    if len == 0 {
+        return Err(ElicitationError::invalid_params(format!(
+            "field `{field_name}` choices must not be empty"
+        )));
+    }
+    if len > MAX_FIELD_CHOICES {
         return Err(ElicitationError::invalid_params(format!(
             "field `{field_name}` has more than {MAX_FIELD_CHOICES} choices"
         )));
     }
-    let mut choices = Vec::with_capacity(values.len());
+    let mut choices = Vec::with_capacity(len);
     let mut seen = HashSet::new();
-    for value in values {
-        let (wire, label, description) = match value {
-            Value::String(s) => (s.as_str(), None, None),
-            Value::Object(obj) => {
+    for value in source.values() {
+        let (wire, label, description) = match (source, value) {
+            (ChoiceSource::Enum(_), Value::String(s)) => (s.as_str(), None, None),
+            (ChoiceSource::Enum(_), Value::Object(obj)) => {
                 let Some(wire) = obj.get("value").and_then(Value::as_str) else {
                     return Err(ElicitationError::invalid_params(format!(
                         "field `{field_name}` titled enum values must include a string value"
@@ -1050,15 +1242,30 @@ fn parse_choices(
                 let description = optional_string(obj, "description", field_name)?;
                 (wire, label, description)
             }
-            _ => {
+            (ChoiceSource::ConstList(_), Value::Object(obj)) => {
+                let Some(wire) = obj.get("const").and_then(Value::as_str) else {
+                    return Err(ElicitationError::invalid_params(format!(
+                        "field `{field_name}` oneOf/anyOf choices must include a string const"
+                    )));
+                };
+                let label = optional_string(obj, "title", field_name)?;
+                let description = optional_string(obj, "description", field_name)?;
+                (wire, label, description)
+            }
+            (ChoiceSource::Enum(_), _) => {
                 return Err(ElicitationError::invalid_params(format!(
                     "field `{field_name}` enum values must be strings or titled choice objects"
+                )))
+            }
+            (ChoiceSource::ConstList(_), _) => {
+                return Err(ElicitationError::invalid_params(format!(
+                    "field `{field_name}` oneOf/anyOf choices must be objects"
                 )))
             }
         };
         if !seen.insert(wire.to_string()) {
             return Err(ElicitationError::invalid_params(format!(
-                "field `{field_name}` enum values must be unique"
+                "field `{field_name}` choice values must be unique"
             )));
         }
         choices.push(FormChoice {
@@ -1070,6 +1277,69 @@ fn parse_choices(
     Ok(choices)
 }
 
+#[derive(Clone, Copy)]
+enum ChoiceSource<'a> {
+    Enum(&'a [Value]),
+    ConstList(&'a [Value]),
+}
+
+impl<'a> ChoiceSource<'a> {
+    fn len(self) -> usize {
+        match self {
+            Self::Enum(values) | Self::ConstList(values) => values.len(),
+        }
+    }
+
+    fn values(self) -> std::slice::Iter<'a, Value> {
+        match self {
+            Self::Enum(values) | Self::ConstList(values) => values.iter(),
+        }
+    }
+}
+
+fn validate_known_format(
+    field_name: &str,
+    format: &str,
+) -> std::result::Result<(), ElicitationError> {
+    match format {
+        "email" | "uri" | "url" | "date-time" | "date" => Ok(()),
+        other => Err(ElicitationError::invalid_params(format!(
+            "field `{field_name}` uses unsupported format `{other}`"
+        ))),
+    }
+}
+
+fn is_valid_email(s: &str) -> bool {
+    let Some((local, domain)) = s.split_once('@') else {
+        return false;
+    };
+    if local.is_empty()
+        || domain.is_empty()
+        || domain.contains('@')
+        || local.starts_with('.')
+        || local.ends_with('.')
+        || local.contains("..")
+        || domain.starts_with('.')
+        || domain.ends_with('.')
+        || domain.contains("..")
+    {
+        return false;
+    }
+    if s.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return false;
+    }
+    let labels: Vec<_> = domain.split('.').collect();
+    labels.len() >= 2
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        })
+}
+
 fn validate_format(
     field: &FormField,
     format: &str,
@@ -1077,8 +1347,7 @@ fn validate_format(
 ) -> std::result::Result<(), ElicitationError> {
     match format {
         "email" => {
-            let at = s.find('@');
-            if at.is_none() || at == Some(0) || s.ends_with('@') {
+            if !is_valid_email(s) {
                 return Err(field.invalid("must be an email address"));
             }
         }
@@ -1088,11 +1357,13 @@ fn validate_format(
                 return Err(field.invalid("must be a URI"));
             }
         }
-        "date-time" if chrono::DateTime::parse_from_rfc3339(s).is_err() => {
-            return Err(field.invalid("must be an RFC 3339 date-time"));
+        "date-time" => {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|_| field.invalid("must be an RFC 3339 date-time"))?;
         }
-        "date" if chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_err() => {
-            return Err(field.invalid("must be an RFC 3339 full-date"));
+        "date" => {
+            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .map_err(|_| field.invalid("must be an RFC 3339 full-date"))?;
         }
         other => {
             return Err(field.invalid(format!("uses unsupported format `{other}`")));
@@ -1153,6 +1424,7 @@ mod tests {
     fn turn() -> ElicitationTurnContext {
         let ch = channel();
         ElicitationTurnContext {
+            authority_id: 0,
             session_id: Some("sess".into()),
             request_id: Some(7),
             channel: ch.clone(),
@@ -1203,6 +1475,7 @@ mod tests {
             -32602
         );
         let params = json!({"requestId":7,"mode":"form","requestedSchema":{"type":"object","properties":{}}});
+        ElicitationCreate::parse(&params, MAX_ELICITATION_BYTES, Some("sess"), Some(7)).unwrap();
         assert_eq!(
             ElicitationCreate::parse(&params, MAX_ELICITATION_BYTES + 1, Some("sess"), Some(7))
                 .unwrap_err()
@@ -1214,6 +1487,12 @@ mod tests {
     #[test]
     fn enforces_field_and_choice_bounds() {
         let mut props = Map::new();
+        for i in 0..MAX_ELICITATION_FIELDS {
+            props.insert(format!("f{i}"), json!({"type":"string"}));
+        }
+        FormSchema::from_requested_schema(&schema(props, vec![])).unwrap();
+
+        let mut props = Map::new();
         for i in 0..=MAX_ELICITATION_FIELDS {
             props.insert(format!("f{i}"), json!({"type":"string"}));
         }
@@ -1223,6 +1502,11 @@ mod tests {
                 .code,
             -32602
         );
+
+        let choices: Vec<String> = (0..MAX_FIELD_CHOICES).map(|i| format!("c{i}")).collect();
+        let mut props = Map::new();
+        props.insert("choice".into(), json!({"type":"string","enum":choices}));
+        FormSchema::from_requested_schema(&schema(props, vec![])).unwrap();
 
         let choices: Vec<String> = (0..=MAX_FIELD_CHOICES).map(|i| format!("c{i}")).collect();
         let mut props = Map::new();
@@ -1254,18 +1538,108 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_titled_oneof_and_anyof_choices() {
+        let mut props = Map::new();
+        props.insert(
+            "mode".into(),
+            json!({"type":"string","oneOf":[{"const":"fast","title":"Fast"},{"const":"safe","title":"Safe","description":"Careful"}],"default":"safe"}),
+        );
+        props.insert(
+            "tags".into(),
+            json!({"type":"array","items":{"anyOf":[{"const":"a","title":"A"},{"const":"b","title":"B"}]},"default":["a"]}),
+        );
+        let form = FormSchema::from_requested_schema(&schema(props, vec![])).unwrap();
+        assert!(matches!(
+            form.field("mode").unwrap().kind,
+            FormFieldKind::SingleSelect { .. }
+        ));
+        assert!(matches!(
+            form.field("tags").unwrap().kind,
+            FormFieldKind::MultiSelect { .. }
+        ));
+        form.validate_content(&form.default_content()).unwrap();
+
+        let mut props = Map::new();
+        props.insert(
+            "bad".into(),
+            json!({"type":"array","items":{"type":"integer","enum":["a"]}}),
+        );
+        assert!(FormSchema::from_requested_schema(&schema(props, vec![])).is_err());
+    }
+
+    #[test]
+    fn validates_formats_and_rejects_malformed_constraints() {
+        let mut props = Map::new();
+        props.insert(
+            "when".into(),
+            json!({"type":"string","format":"date","default":"2026-09-12"}),
+        );
+        props.insert(
+            "at".into(),
+            json!({"type":"string","format":"date-time","default":"2026-09-12T10:00:00Z"}),
+        );
+        props.insert("email".into(), json!({"type":"string","format":"email"}));
+        let form = FormSchema::from_requested_schema(&schema(props, vec![])).unwrap();
+        form.validate_content(&form.default_content()).unwrap();
+        assert!(form
+            .field("email")
+            .unwrap()
+            .validate_value(&json!("a b@c.com"))
+            .is_err());
+        assert!(form
+            .field("email")
+            .unwrap()
+            .validate_value(&json!("a@b@c.com"))
+            .is_err());
+        assert!(form
+            .field("email")
+            .unwrap()
+            .validate_value(&json!("a..b@c.com"))
+            .is_err());
+        assert!(form
+            .field("email")
+            .unwrap()
+            .validate_value(&json!("a@b..com"))
+            .is_err());
+
+        let mut props = Map::new();
+        props.insert("empty".into(), json!({"type":"string","enum":[]}));
+        assert!(FormSchema::from_requested_schema(&schema(props, vec![])).is_err());
+        let mut props = Map::new();
+        props.insert(
+            "bad_format".into(),
+            json!({"type":"string","format":"hostname"}),
+        );
+        assert!(FormSchema::from_requested_schema(&schema(props, vec![])).is_err());
+        let mut props = Map::new();
+        props.insert(
+            "bad_len".into(),
+            json!({"type":"string","minLength":5,"maxLength":3}),
+        );
+        assert!(FormSchema::from_requested_schema(&schema(props, vec![])).is_err());
+        let mut props = Map::new();
+        props.insert(
+            "bad_num".into(),
+            json!({"type":"number","minimum":10,"maximum":1}),
+        );
+        assert!(FormSchema::from_requested_schema(&schema(props, vec![])).is_err());
+    }
+
     #[tokio::test]
     async fn coordinator_allows_one_pending_and_authorized_resolution() {
         let coord = ElicitationCoordinator::new();
         let gen = ConnectionGeneration::new();
         let params = json!({"sessionId":"sess","mode":"form","message":"m","requestedSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}});
+        let mut active_turn = turn();
+        active_turn.authority_id = coord.open_generation_turn(gen);
         let start = coord
             .start(
                 gen,
                 JsonRpcId::Number(5),
                 &params,
                 200,
-                Some(&turn()),
+                Some(&active_turn),
                 "agent",
             )
             .await;
@@ -1279,7 +1653,7 @@ mod tests {
                 JsonRpcId::Number(6),
                 &params,
                 200,
-                Some(&turn()),
+                Some(&active_turn),
                 "agent",
             )
             .await;
@@ -1302,6 +1676,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(lease.wait().await, ElicitationOutcome::Accept(content));
+        assert_eq!(coord.active_count().await, 1);
+        assert!(coord.finish_generation(gen, &nonce).await);
         assert_eq!(coord.active_count().await, 0);
     }
 
@@ -1310,13 +1686,15 @@ mod tests {
         let coord = ElicitationCoordinator::new();
         let gen = ConnectionGeneration::new();
         let params = json!({"requestId":7,"mode":"form","requestedSchema":{"type":"object","properties":{}}});
+        let mut active_turn = turn();
+        active_turn.authority_id = coord.open_generation_turn(gen);
         let start = coord
             .start(
                 gen,
                 JsonRpcId::String("s".into()),
                 &params,
                 200,
-                Some(&turn()),
+                Some(&active_turn),
                 "agent",
             )
             .await;
@@ -1324,6 +1702,17 @@ mod tests {
             panic!("expected lease")
         };
         let nonce = lease.presentation.nonce.clone();
+        assert!(coord
+            .resolve(
+                ConnectionGeneration::new(),
+                &nonce,
+                "u1",
+                &channel(),
+                Some("99"),
+                ElicitationOutcome::Cancel
+            )
+            .await
+            .is_err());
         assert!(coord
             .resolve(
                 gen,
@@ -1335,11 +1724,40 @@ mod tests {
             )
             .await
             .is_err());
+        let mut wrong_channel = channel();
+        wrong_channel.channel_id = "11".into();
+        assert!(coord
+            .resolve(
+                gen,
+                &nonce,
+                "u1",
+                &wrong_channel,
+                Some("99"),
+                ElicitationOutcome::Cancel
+            )
+            .await
+            .is_err());
+        assert!(coord
+            .resolve(
+                gen,
+                &nonce,
+                "u1",
+                &channel(),
+                Some("100"),
+                ElicitationOutcome::Cancel
+            )
+            .await
+            .is_err());
         assert_eq!(coord.active_count().await, 1);
         coord
             .expire_generation(gen, ElicitationOutcome::Cancel)
             .await;
         assert_eq!(lease.wait().await, ElicitationOutcome::Cancel);
+        assert!(
+            !coord
+                .is_authorized_pending(gen, &nonce, "u1", &channel())
+                .await
+        );
         assert!(coord
             .resolve(
                 gen,
@@ -1351,5 +1769,55 @@ mod tests {
             )
             .await
             .is_err());
+    }
+    #[tokio::test]
+    async fn revoked_generation_rejects_copied_turn_after_next_prompt_reauthorizes() {
+        let coord = ElicitationCoordinator::new();
+        let gen = ConnectionGeneration::new();
+        let params = json!({"requestId":7,"mode":"form","requestedSchema":{"type":"object","properties":{}}});
+        let mut copied_turn = turn();
+        copied_turn.authority_id = coord.open_generation_turn(gen);
+        coord.revoke_generation(gen);
+        assert!(matches!(
+            coord
+                .start(
+                    gen,
+                    JsonRpcId::Number(1),
+                    &params,
+                    200,
+                    Some(&copied_turn),
+                    "agent"
+                )
+                .await,
+            ElicitationStart::Immediate(ElicitationOutcome::Cancel)
+        ));
+        let mut next_turn = turn();
+        next_turn.authority_id = coord.open_generation_turn(gen);
+        assert!(matches!(
+            coord
+                .start(
+                    gen,
+                    JsonRpcId::Number(2),
+                    &params,
+                    200,
+                    Some(&copied_turn),
+                    "agent"
+                )
+                .await,
+            ElicitationStart::Immediate(ElicitationOutcome::Cancel)
+        ));
+        assert!(matches!(
+            coord
+                .start(
+                    gen,
+                    JsonRpcId::Number(3),
+                    &params,
+                    200,
+                    Some(&next_turn),
+                    "agent"
+                )
+                .await,
+            ElicitationStart::Present(_)
+        ));
     }
 }

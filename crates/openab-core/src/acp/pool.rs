@@ -188,6 +188,7 @@ async fn setup_facade_session(
 fn purge_session_entries(state: &mut PoolState, key: &str) {
     state.cancel_handles.remove(key);
     state.activity.remove(key);
+    state.form_capabilities.remove(key);
     state.elicitations.remove(key);
     state.pgids.remove(key);
     state.suspended.remove(key);
@@ -238,6 +239,7 @@ fn apply_hung_eviction(
         return false;
     }
     if let Some((coordinator, generation)) = state.elicitations.get(key).cloned() {
+        coordinator.revoke_generation(generation);
         tokio::spawn(async move {
             coordinator
                 .expire_generation(generation, ElicitationOutcome::Cancel)
@@ -684,6 +686,7 @@ impl SessionPool {
                     state.activity.remove(&key);
                     state.form_capabilities.remove(&key);
                     if let Some((coordinator, generation)) = state.elicitations.remove(&key) {
+                        coordinator.revoke_generation(generation);
                         tokio::spawn(async move {
                             coordinator
                                 .expire_generation(generation, ElicitationOutcome::Cancel)
@@ -893,25 +896,10 @@ impl SessionPool {
     /// Arc reference is dropped (after streaming finishes). The next message will
     /// trigger a fresh `get_or_create` with a new ACP session.
     pub async fn reset_session(&self, thread_id: &str) -> Result<()> {
-        // Send session/cancel via the lock-free stdin handle first.
-        // This stops in-flight streaming even while with_connection() holds the
-        // connection mutex, so the old process finishes promptly.
-        if let Some((stdin, session_id)) = {
+        let cancel_handle = {
             let state = self.state.read().await;
             state.cancel_handles.get(thread_id).cloned()
-        } {
-            let data = serde_json::to_string(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "session/cancel",
-                "params": {"sessionId": session_id}
-            }))?;
-            tracing::info!(session_id = %crate::redact::redact_session_ids(&session_id), "reset: sending session/cancel");
-            use tokio::io::AsyncWriteExt;
-            let mut w = stdin.lock().await;
-            let _ = w.write_all(data.as_bytes()).await;
-            let _ = w.write_all(b"\n").await;
-            let _ = w.flush().await;
-        }
+        };
 
         let mut state = self.state.write().await;
         let elicitation_handle = state.elicitations.remove(thread_id);
@@ -932,6 +920,19 @@ impl SessionPool {
             coordinator
                 .expire_generation(generation, ElicitationOutcome::Cancel)
                 .await;
+        }
+        if let Some((stdin, session_id)) = cancel_handle {
+            let data = serde_json::to_string(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": {"sessionId": session_id}
+            }))?;
+            tracing::info!(session_id = %crate::redact::redact_session_ids(&session_id), "reset: sending session/cancel");
+            use tokio::io::AsyncWriteExt;
+            let mut w = stdin.lock().await;
+            let _ = w.write_all(data.as_bytes()).await;
+            let _ = w.write_all(b"\n").await;
+            let _ = w.flush().await;
         }
         if had_active {
             info!(thread_id = %crate::redact::redact_session_ids(thread_id), "session reset");
@@ -1041,7 +1042,9 @@ impl SessionPool {
                 info!(thread_id = %crate::redact::redact_session_ids(&key), "cleaning up idle session");
                 state.cancel_handles.remove(&key);
                 state.activity.remove(&key);
+                state.form_capabilities.remove(&key);
                 if let Some((coordinator, generation)) = state.elicitations.remove(&key) {
+                    coordinator.revoke_generation(generation);
                     tokio::spawn(async move {
                         coordinator
                             .expire_generation(generation, ElicitationOutcome::Cancel)
@@ -1131,6 +1134,7 @@ mod tests {
         remove_if_same_handle, PoolState,
     };
     use crate::acp::connection::SessionActivity;
+    use crate::acp::elicitation::{ConnectionGeneration, ElicitationCoordinator};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -1475,7 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn purge_session_entries_drops_all_entries_for_evicted_key_only() {
+    fn purge_session_entries_clears_reset_and_eviction_state_for_key_only() {
         let mut state = PoolState {
             active: HashMap::new(),
             cancel_handles: HashMap::new(),
@@ -1485,8 +1489,20 @@ mod tests {
                 ("hung".to_string(), Arc::new(SessionActivity::new())),
                 ("other".to_string(), Arc::new(SessionActivity::new())),
             ]),
-            form_capabilities: HashMap::new(),
-            elicitations: HashMap::new(),
+            form_capabilities: HashMap::from([
+                ("hung".to_string(), true),
+                ("other".to_string(), false),
+            ]),
+            elicitations: HashMap::from([
+                (
+                    "hung".to_string(),
+                    (ElicitationCoordinator::new(), ConnectionGeneration::new()),
+                ),
+                (
+                    "other".to_string(),
+                    (ElicitationCoordinator::new(), ConnectionGeneration::new()),
+                ),
+            ]),
             pgids: HashMap::from([("hung".to_string(), 1234), ("other".to_string(), 5678)]),
             suspended: HashMap::from([
                 ("hung".to_string(), "session-hung".to_string()),
@@ -1505,6 +1521,8 @@ mod tests {
         // Evicted key must not be resumable: no suspended/persisted entry left.
         assert!(!state.activity.contains_key("hung"));
         assert!(!state.cancel_handles.contains_key("hung"));
+        assert!(!state.form_capabilities.contains_key("hung"));
+        assert!(!state.elicitations.contains_key("hung"));
         assert!(!state.pgids.contains_key("hung"));
         assert!(!state.suspended.contains_key("hung"));
         assert!(!state.persisted.contains_key("hung"));
@@ -1523,6 +1541,8 @@ mod tests {
             Some(&"session-other".to_string())
         );
         assert!(state.activity.contains_key("other"));
+        assert_eq!(state.form_capabilities.get("other"), Some(&false));
+        assert!(state.elicitations.contains_key("other"));
     }
 
     #[test]

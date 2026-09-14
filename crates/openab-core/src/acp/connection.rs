@@ -381,35 +381,47 @@ where
                         let writer = writer.clone();
                         let elicitation = elicitation.clone();
                         tokio::spawn(async move {
-                            let (presentation, receiver) = lease.into_parts();
+                            let (presentation, mut receiver) = lease.into_parts();
                             let id = presentation.agent_request_id.clone();
                             let generation = presentation.generation;
                             let nonce = presentation.nonce.clone();
                             let form = presentation.form.clone();
+                            let presenter_task = presenter.clone();
+                            let present_task = tokio::spawn(async move {
+                                presenter_task.present_form(presentation).await
+                            });
                             let outcome = tokio::select! {
-                                result = presenter.present_form(presentation) => {
+                                outcome = async { (&mut receiver).await.unwrap_or(ElicitationOutcome::Cancel) } => {
+                                    validate_accepted_content(&form, outcome)
+                                }
+                                result = present_task => {
+                                    let result = result
+                                        .map_err(|e| presentation_failure(anyhow::anyhow!("elicitation presentation task failed: {e}")))
+                                        .and_then(|result| result.map_err(presentation_failure));
                                     match result
-                                        .map_err(presentation_failure)
                                         .and_then(|outcome| validate_accepted_content(&form, outcome))
                                     {
                                         Ok(outcome) => {
-                                            if !elicitation.complete_generation(generation).await {
-                                                let _ = presenter.expire_form(&nonce, ElicitationStatus::Expired).await;
-                                                return;
+                                            if elicitation.complete_generation(generation, &nonce).await {
+                                                Ok(outcome)
+                                            } else {
+                                                validate_accepted_content(
+                                                    &form,
+                                                    receiver.await.unwrap_or(ElicitationOutcome::Cancel),
+                                                )
                                             }
-                                            Ok(outcome)
                                         }
                                         Err(err) => {
-                                            if !elicitation.complete_generation(generation).await {
-                                                let _ = presenter.expire_form(&nonce, ElicitationStatus::Expired).await;
-                                                return;
+                                            if elicitation.complete_generation(generation, &nonce).await {
+                                                Err(err)
+                                            } else {
+                                                validate_accepted_content(
+                                                    &form,
+                                                    receiver.await.unwrap_or(ElicitationOutcome::Cancel),
+                                                )
                                             }
-                                            Err(err)
                                         }
                                     }
-                                }
-                                outcome = async { receiver.await.unwrap_or(ElicitationOutcome::Cancel) } => {
-                                    validate_accepted_content(&form, outcome)
                                 }
                             };
                             let status = match &outcome {
@@ -430,11 +442,15 @@ where
                             if !delivered {
                                 warn!("failed to write elicitation response; expiring generation");
                                 elicitation
-                                    .expire_generation(generation, ElicitationOutcome::Cancel)
+                                    .expire_generation_nonce(
+                                        generation,
+                                        &nonce,
+                                        ElicitationOutcome::Cancel,
+                                    )
                                     .await;
                             }
                             let _ = presenter.expire_form(&nonce, status).await;
-                            elicitation.finish_generation(generation).await;
+                            elicitation.finish_generation(generation, &nonce).await;
                         });
                     }
                 }
@@ -967,7 +983,9 @@ impl AcpConnection {
         *self.notify_tx.lock().await = Some(tx);
 
         let id = self.next_id();
+        let authority_id = self.elicitation.open_generation_turn(self.generation);
         *self.elicitation_turn.lock().await = Some(ElicitationTurnContext {
+            authority_id,
             session_id: self.acp_session_id.clone(),
             request_id: Some(id),
             channel: turn_channel,
@@ -1026,6 +1044,9 @@ impl AcpConnection {
             .expire_generation(self.generation, ElicitationOutcome::Cancel)
             .await;
         self.pending.lock().await.remove(&request_id);
+        *self.elicitation_turn.lock().await = None;
+        *self.notify_tx.lock().await = None;
+        self.activity.set_in_flight(false);
         let Some(session_id) = self.acp_session_id.as_deref() else {
             return;
         };
@@ -1114,6 +1135,7 @@ impl Drop for AcpConnection {
         }
         let coordinator = self.elicitation.clone();
         let generation = self.generation;
+        coordinator.revoke_generation(generation);
         tokio::spawn(async move {
             coordinator
                 .expire_generation(generation, ElicitationOutcome::Cancel)
