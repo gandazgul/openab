@@ -119,12 +119,7 @@ fn classify_hung(
 /// either resumes the session, so both are credentials. Extracted from the loop in `cleanup_idle`
 /// so the redaction can be exercised by a test for real — R1 redacted the sites it enumerated and
 /// this force-evict site was outside that list, logging both ids raw.
-fn warn_force_evicting_hung(
-    key: &str,
-    session_id: Option<&str>,
-    age_secs: u64,
-    threshold_secs: u64,
-) {
+fn warn_force_evicting_hung(key: &str, session_id: Option<&str>, age_secs: u64, threshold_secs: u64) {
     warn!(
         thread_id = %crate::redact::redact_session_ids(key),
         session_id = %session_id.map(crate::redact::redact_session_ids).unwrap_or_default(),
@@ -749,12 +744,7 @@ impl SessionPool {
         // supersedes under the same key (its guard cannot fire if that predecessor is hung). F3.
         #[cfg(feature = "acp-mcp")]
         if let Some(token) = session_token {
-            install_facade_token(
-                &mut state,
-                thread_id,
-                token,
-                self.session_registrar.as_ref(),
-            );
+            install_facade_token(&mut state, thread_id, token, self.session_registrar.as_ref());
         }
         self.save_mapping(&state.persisted);
 
@@ -789,12 +779,11 @@ impl SessionPool {
     {
         let conn = {
             let state = self.state.read().await;
-            state.active.get(thread_id).cloned().ok_or_else(|| {
-                anyhow!(
-                    "no connection for thread {}",
-                    crate::redact::redact_session_ids(thread_id)
-                )
-            })?
+            state
+                .active
+                .get(thread_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("no connection for thread {}", crate::redact::redact_session_ids(thread_id)))?
         };
 
         let mut conn = conn.lock().await;
@@ -822,12 +811,11 @@ impl SessionPool {
     ) -> Result<Vec<ConfigOption>> {
         let conn = {
             let state = self.state.read().await;
-            state.active.get(thread_id).cloned().ok_or_else(|| {
-                anyhow!(
-                    "no connection for thread {}",
-                    crate::redact::redact_session_ids(thread_id)
-                )
-            })?
+            state
+                .active
+                .get(thread_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("no connection for thread {}", crate::redact::redact_session_ids(thread_id)))?
         };
         let mut conn = conn.lock().await;
         conn.set_config_option(config_id, value).await
@@ -839,12 +827,11 @@ impl SessionPool {
     pub async fn get_usage(&self, thread_id: &str) -> Result<crate::acp::protocol::UsageReport> {
         let conn = {
             let state = self.state.read().await;
-            state.active.get(thread_id).cloned().ok_or_else(|| {
-                anyhow!(
-                    "no connection for thread {}",
-                    crate::redact::redact_session_ids(thread_id)
-                )
-            })?
+            state
+                .active
+                .get(thread_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("no connection for thread {}", crate::redact::redact_session_ids(thread_id)))?
         };
         let mut conn = conn.lock().await;
         conn.get_usage().await
@@ -855,17 +842,11 @@ impl SessionPool {
     pub async fn cancel_session(&self, thread_id: &str) -> Result<()> {
         let (stdin, session_id, elicitation_handle) = {
             let state = self.state.read().await;
-            let (stdin, session_id) =
-                state
-                    .cancel_handles
-                    .get(thread_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "no session for thread {}",
-                            crate::redact::redact_session_ids(thread_id)
-                        )
-                    })?;
+            let (stdin, session_id) = state
+                .cancel_handles
+                .get(thread_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("no session for thread {}", crate::redact::redact_session_ids(thread_id)))?;
             (
                 stdin,
                 session_id,
@@ -938,10 +919,7 @@ impl SessionPool {
             info!(thread_id = %crate::redact::redact_session_ids(thread_id), "session reset");
             Ok(())
         } else {
-            Err(anyhow!(
-                "no session for thread {}",
-                crate::redact::redact_session_ids(thread_id)
-            ))
+            Err(anyhow!("no session for thread {}", crate::redact::redact_session_ids(thread_id)))
         }
     }
 
@@ -1196,28 +1174,11 @@ mod tests {
         let mut state = empty_pool_state();
 
         // Predecessor registers, then a successor takes over the SAME key.
-        super::install_facade_token(
-            &mut state,
-            "discord:acp_x",
-            "T_pred".into(),
-            Some(&registrar),
-        );
-        assert!(
-            reg.revoked().is_empty(),
-            "nothing to revoke on the first install"
-        );
-        super::install_facade_token(
-            &mut state,
-            "discord:acp_x",
-            "T_succ".into(),
-            Some(&registrar),
-        );
+        super::install_facade_token(&mut state, "discord:acp_x", "T_pred".into(), Some(&registrar));
+        assert!(reg.revoked().is_empty(), "nothing to revoke on the first install");
+        super::install_facade_token(&mut state, "discord:acp_x", "T_succ".into(), Some(&registrar));
 
-        assert_eq!(
-            reg.revoked(),
-            vec!["T_pred"],
-            "the predecessor token must be revoked"
-        );
+        assert_eq!(reg.revoked(), vec!["T_pred"], "the predecessor token must be revoked");
         assert_eq!(
             state.facade_tokens.get("discord:acp_x").map(String::as_str),
             Some("T_succ"),
@@ -1234,25 +1195,14 @@ mod tests {
         let reg = Arc::new(CountingRegistrar::default());
         let registrar: Arc<dyn crate::acp_mcp::SessionTokenRegistrar> = reg.clone();
         let mut state = empty_pool_state();
-        state
-            .facade_tokens
-            .insert("discord:acp_x".into(), "T_hung".into());
+        state.facade_tokens.insert("discord:acp_x".into(), "T_hung".into());
         // A different session's token must be untouched.
-        state
-            .facade_tokens
-            .insert("discord:acp_y".into(), "T_other".into());
+        state.facade_tokens.insert("discord:acp_y".into(), "T_other".into());
 
         super::revoke_facade_token_for_key(&mut state, "discord:acp_x", Some(&registrar));
 
-        assert_eq!(
-            reg.revoked(),
-            vec!["T_hung"],
-            "only the evicted session's token is revoked"
-        );
-        assert!(
-            !state.facade_tokens.contains_key("discord:acp_x"),
-            "and it is forgotten"
-        );
+        assert_eq!(reg.revoked(), vec!["T_hung"], "only the evicted session's token is revoked");
+        assert!(!state.facade_tokens.contains_key("discord:acp_x"), "and it is forgotten");
         assert_eq!(
             state.facade_tokens.get("discord:acp_y").map(String::as_str),
             Some("T_other"),
@@ -1459,23 +1409,11 @@ mod tests {
         });
 
         let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        assert!(
-            out.contains("force-evicting hung session"),
-            "the warning must fire: {out}"
-        );
+        assert!(out.contains("force-evicting hung session"), "the warning must fire: {out}");
         assert!(!out.contains(uuid), "no raw uuid may reach the log: {out}");
-        assert!(
-            !out.contains("acp_") && !out.contains("sess_"),
-            "no raw id prefix either: {out}"
-        );
-        assert!(
-            out.contains('#'),
-            "the redaction tag must be present: {out}"
-        );
-        assert!(
-            out.contains("discord"),
-            "the readable platform half must survive: {out}"
-        );
+        assert!(!out.contains("acp_") && !out.contains("sess_"), "no raw id prefix either: {out}");
+        assert!(out.contains('#'), "the redaction tag must be present: {out}");
+        assert!(out.contains("discord"), "the readable platform half must survive: {out}");
     }
 
     #[test]

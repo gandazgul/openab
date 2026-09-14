@@ -61,9 +61,7 @@ impl MultibotCache {
             threads.clone()
         };
         let path = self.path.clone();
-        tokio::task::spawn_blocking(move || persist(&path, &snapshot))
-            .await
-            .ok();
+        tokio::task::spawn_blocking(move || persist(&path, &snapshot)).await.ok();
     }
 }
 

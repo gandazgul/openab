@@ -23,9 +23,7 @@ use serenity::builder::{
 };
 use serenity::http::Http;
 use serenity::model::application::{ActionRowComponent, ButtonStyle, InputTextStyle};
-use serenity::model::application::{
-    Command, CommandOptionType, ComponentInteractionDataKind, Interaction,
-};
+use serenity::model::application::{Command, CommandOptionType, ComponentInteractionDataKind, Interaction};
 use serenity::model::channel::{
     AutoArchiveDuration, Message, MessageFlags, MessageType, Reaction, ReactionType,
 };
@@ -1203,11 +1201,7 @@ impl ChatAdapter for DiscordAdapter {
         let ch_id: u64 = Self::resolve_channel(channel).parse()?;
         // Truncate at char boundary to avoid panic on multi-byte chars (中文/Emoji).
         let truncated: &str = if title.chars().count() > 100 {
-            let end = title
-                .char_indices()
-                .nth(100)
-                .map(|(i, _)| i)
-                .unwrap_or(title.len());
+            let end = title.char_indices().nth(100).map(|(i, _)| i).unwrap_or(title.len());
             &title[..end]
         } else {
             title
@@ -1352,9 +1346,7 @@ impl EventHandler for Handler {
             let key = msg.channel_id.to_string();
             {
                 let mut cache = self.multibot_threads.lock().await;
-                cache
-                    .entry(key.clone())
-                    .or_insert_with(tokio::time::Instant::now);
+                cache.entry(key.clone()).or_insert_with(tokio::time::Instant::now);
             }
             // Persist to disk — multibot is irreversible
             self.multibot_cache.mark_multibot(&key).await;
@@ -1517,14 +1509,11 @@ impl EventHandler for Handler {
         // non-allowed channels. Moved before bot gating so ambient context
         // can be resolved early — bot messages in ambient contexts must bypass
         // discord-level bot gating (#1197).
-        let (
-            in_thread,
-            bot_owns_thread,
-            thread_parent_id,
-            is_dm,
-            is_structural_thread,
-            structural_parent_id,
-        ) = match msg.channel_id.to_channel(&ctx.http).await {
+        let (in_thread, bot_owns_thread, thread_parent_id, is_dm, is_structural_thread, structural_parent_id) = match msg
+            .channel_id
+            .to_channel(&ctx.http)
+            .await
+        {
             Ok(serenity::model::channel::Channel::Guild(gc)) => {
                 let parent = gc.parent_id.map(|id| id.get().to_string());
                 let has_thread_metadata = gc.thread_metadata.is_some();
@@ -1553,11 +1542,7 @@ impl EventHandler for Handler {
                     if has_thread_metadata { parent } else { None },
                     false,
                     has_thread_metadata,
-                    if has_thread_metadata {
-                        parent_u64
-                    } else {
-                        None
-                    },
+                    if has_thread_metadata { parent_u64 } else { None },
                 )
             }
             Ok(serenity::model::channel::Channel::Private(_)) => {
@@ -1577,12 +1562,7 @@ impl EventHandler for Handler {
         // Check if message is in an ambient context (resolved early so bot
         // messages destined for ambient can bypass discord-level bot gating).
         let in_ambient_context = self.ambient.as_ref().is_some_and(|ambient| {
-            ambient.should_buffer(
-                channel_id,
-                is_structural_thread,
-                bot_owns_thread,
-                structural_parent_id,
-            )
+            ambient.should_buffer(channel_id, is_structural_thread, bot_owns_thread, structural_parent_id)
         });
 
         // --- Ambient early-route for bot messages ---
@@ -1629,15 +1609,13 @@ impl EventHandler for Handler {
 
                     let target = Arc::clone(&self.router) as Arc<dyn DispatchTarget>;
                     debug!(channel_id = %msg.channel_id, bot_id = %msg.author.id, "ambient early-route: bot msg buffered");
-                    ambient
-                        .submit(
-                            &channel_id.to_string(),
-                            channel_ref,
-                            adapter.clone(),
-                            target,
-                            ambient_msg,
-                        )
-                        .await;
+                    ambient.submit(
+                        &channel_id.to_string(),
+                        channel_ref,
+                        adapter.clone(),
+                        target,
+                        ambient_msg,
+                    ).await;
                 }
             }
             return;
@@ -1793,15 +1771,13 @@ impl EventHandler for Handler {
                     };
 
                     let target = Arc::clone(&self.router) as Arc<dyn DispatchTarget>;
-                    ambient
-                        .submit(
-                            &channel_id.to_string(),
-                            channel_ref,
-                            adapter.clone(),
-                            target,
-                            ambient_msg,
-                        )
-                        .await;
+                    ambient.submit(
+                        &channel_id.to_string(),
+                        channel_ref,
+                        adapter.clone(),
+                        target,
+                        ambient_msg,
+                    ).await;
                     return;
                 }
             }
@@ -1952,8 +1928,7 @@ impl EventHandler for Handler {
                 // be uploaded to S3, not inlined).
                 let attachment_size = u64::from(attachment.size);
                 #[cfg(feature = "filestore")]
-                let skip_cap =
-                    self.filestore.is_some() && attachment_size > crate::media::TEXT_INLINE_LIMIT;
+                let skip_cap = self.filestore.is_some() && attachment_size > crate::media::TEXT_INLINE_LIMIT;
                 #[cfg(not(feature = "filestore"))]
                 let skip_cap = false;
                 if !skip_cap && text_file_bytes + attachment_size > TEXT_TOTAL_CAP {
@@ -2034,9 +2009,7 @@ impl EventHandler for Handler {
                                     attachment.content_type.as_deref(),
                                     None,
                                     fs,
-                                )
-                                .await
-                                {
+                                ).await {
                                     extra_blocks.push(block);
                                 }
                             }
@@ -2101,11 +2074,10 @@ impl EventHandler for Handler {
         let trigger_msg = discord_msg_ref(&msg);
 
         // Per-thread streaming: check if another bot is present in this thread
-        let other_bot_present_flag =
-            {
-                let cache = self.multibot_threads.lock().await;
-                cache.contains_key(&msg.channel_id.to_string())
-            } || self.multibot_cache.is_multibot(&msg.channel_id.to_string());
+        let other_bot_present_flag = {
+            let cache = self.multibot_threads.lock().await;
+            cache.contains_key(&msg.channel_id.to_string())
+        } || self.multibot_cache.is_multibot(&msg.channel_id.to_string());
 
         // Backfill thread_id: when OAB just created a new thread, the sender
         // was built before the thread existed. Patch it so the agent sees
@@ -2281,30 +2253,24 @@ impl EventHandler for Handler {
                     if !in_allowed_thread {
                         return;
                     }
-                    (
-                        ChannelRef {
-                            platform: "discord".into(),
-                            channel_id: channel_id.get().to_string(),
-                            thread_id: None,
-                            parent_id: parent.map(|p| p.to_string()),
-                            origin_event_id: None,
-                        },
-                        true,
-                    )
+                    (ChannelRef {
+                        platform: "discord".into(),
+                        channel_id: channel_id.get().to_string(),
+                        thread_id: None,
+                        parent_id: parent.map(|p| p.to_string()),
+                        origin_event_id: None,
+                    }, true)
                 } else {
                     if !in_allowed_channel {
                         return;
                     }
-                    (
-                        ChannelRef {
-                            platform: "discord".into(),
-                            channel_id: channel_id.get().to_string(),
-                            thread_id: None,
-                            parent_id: None,
-                            origin_event_id: None,
-                        },
-                        false,
-                    )
+                    (ChannelRef {
+                        platform: "discord".into(),
+                        channel_id: channel_id.get().to_string(),
+                        thread_id: None,
+                        parent_id: None,
+                        origin_event_id: None,
+                    }, false)
                 }
             }
             _ => return,
@@ -2318,8 +2284,7 @@ impl EventHandler for Handler {
                 self.allow_user_messages,
                 AllowUsers::Involved | AllowUsers::MultibotMentions
             ) {
-            self.bot_participated_in_thread(&ctx.http, channel_id, bot_id)
-                .await
+            self.bot_participated_in_thread(&ctx.http, channel_id, bot_id).await
         } else {
             // For non-thread: still check multibot cache for dispatch info.
             let mb = {
@@ -2353,16 +2318,17 @@ impl EventHandler for Handler {
 
         tokio::spawn(async move {
             // F2 fix: Fetch user info first, then apply user gating with confirmed bot status.
-            let (sender_name, display_name, is_bot_confirmed) = match user_id.to_user(&http).await {
-                Ok(user) => {
-                    let display = user.global_name.as_ref().unwrap_or(&user.name).clone();
-                    (user.name.clone(), display, user.bot)
-                }
-                Err(_) => {
-                    let fallback = user_id.to_string();
-                    (fallback.clone(), fallback, is_reactor_bot)
-                }
-            };
+            let (sender_name, display_name, is_bot_confirmed) =
+                match user_id.to_user(&http).await {
+                    Ok(user) => {
+                        let display = user.global_name.as_ref().unwrap_or(&user.name).clone();
+                        (user.name.clone(), display, user.bot)
+                    }
+                    Err(_) => {
+                        let fallback = user_id.to_string();
+                        (fallback.clone(), fallback, is_reactor_bot)
+                    }
+                };
 
             // Defense-in-depth: if to_user() reveals this is a bot but member was
             // None (rare edge case), re-apply bot gating retroactively.
@@ -2370,7 +2336,8 @@ impl EventHandler for Handler {
                 match allow_bot_messages {
                     AllowBots::Off | AllowBots::Mentions => return,
                     AllowBots::All => {
-                        if !trusted_bot_ids.is_empty() && !trusted_bot_ids.contains(&user_id.get())
+                        if !trusted_bot_ids.is_empty()
+                            && !trusted_bot_ids.contains(&user_id.get())
                         {
                             return;
                         }
@@ -2453,31 +2420,23 @@ impl EventHandler for Handler {
             CreateCommand::new("reset").description("Reset the conversation session"),
             CreateCommand::new("remind")
                 .description("Set a one-shot reminder to mention users/roles after a delay")
-                .add_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "targets",
-                        "Users/roles to mention (e.g. @user1 @role1)",
-                    )
-                    .required(true),
-                )
-                .add_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "message",
-                        "Reminder message",
-                    )
-                    .required(true),
-                )
-                .add_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "delay",
-                        "Delay before firing (e.g. 30m, 2h, 1d)",
-                    )
-                    .required(true),
-                ),
-            CreateCommand::new("auth").description("Authenticate the backend agent (device flow)"),
+                .add_option(CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "targets",
+                    "Users/roles to mention (e.g. @user1 @role1)",
+                ).required(true))
+                .add_option(CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "message",
+                    "Reminder message",
+                ).required(true))
+                .add_option(CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "delay",
+                    "Delay before firing (e.g. 30m, 2h, 1d)",
+                ).required(true)),
+            CreateCommand::new("auth")
+                .description("Authenticate the backend agent (device flow)"),
             CreateCommand::new("usage")
                 .description("Show backend account usage and billing information"),
             CreateCommand::new("export-thread")
@@ -2759,9 +2718,7 @@ impl Handler {
         if !self.router.pool().has_active_session(&thread_key).await {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content(
-                        "⚠️ No active session. Start a conversation first by @mentioning the bot.",
-                    )
+                    .content("⚠️ No active session. Start a conversation first by @mentioning the bot.")
                     .ephemeral(true),
             );
             if let Err(e) = cmd.create_response(&ctx.http, response).await {
@@ -2772,9 +2729,8 @@ impl Handler {
 
         // The ACP round-trip can exceed Discord's 3-second interaction
         // deadline — acknowledge with a deferred ephemeral response first.
-        let defer = CreateInteractionResponse::Defer(
-            CreateInteractionResponseMessage::new().ephemeral(true),
-        );
+        let defer =
+            CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new().ephemeral(true));
         if let Err(e) = cmd.create_response(&ctx.http, defer).await {
             tracing::error!(error = %e, "failed to defer /usage response");
             return;
@@ -2911,18 +2867,15 @@ impl Handler {
 
         // Extract options
         let opts = &cmd.data.options;
-        let targets_raw = opts
-            .iter()
+        let targets_raw = opts.iter()
             .find(|o| o.name == "targets")
             .and_then(|o| o.value.as_str())
             .unwrap_or("");
-        let message = opts
-            .iter()
+        let message = opts.iter()
             .find(|o| o.name == "message")
             .and_then(|o| o.value.as_str())
             .unwrap_or("");
-        let delay_raw = opts
-            .iter()
+        let delay_raw = opts.iter()
             .find(|o| o.name == "delay")
             .and_then(|o| o.value.as_str())
             .unwrap_or("");
@@ -2984,10 +2937,7 @@ impl Handler {
         if targets.len() > remind::MAX_TARGETS {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content(format!(
-                        "⚠️ Too many targets (max {}). Use a @role instead.",
-                        remind::MAX_TARGETS
-                    ))
+                    .content(format!("⚠️ Too many targets (max {}). Use a @role instead.", remind::MAX_TARGETS))
                     .ephemeral(true),
             );
             let _ = cmd.create_response(&ctx.http, response).await;
@@ -3087,9 +3037,7 @@ impl Handler {
         if AUTH_IN_PROGRESS.swap(true, std::sync::atomic::Ordering::Acquire) {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content(
-                        "⚠️ Authentication already in progress. Please wait for it to complete.",
-                    )
+                    .content("⚠️ Authentication already in progress. Please wait for it to complete.")
                     .ephemeral(true),
             );
             let _ = cmd.create_response(&ctx.http, response).await;
@@ -3102,9 +3050,7 @@ impl Handler {
                 AUTH_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
                 let response = CreateInteractionResponse::Message(
                     CreateInteractionResponseMessage::new()
-                        .content(
-                            "⚠️ No auth command configured (`OPENAB_AGENT_AUTH_COMMAND` not set).",
-                        )
+                        .content("⚠️ No auth command configured (`OPENAB_AGENT_AUTH_COMMAND` not set).")
                         .ephemeral(true),
                 );
                 let _ = cmd.create_response(&ctx.http, response).await;
@@ -3127,9 +3073,9 @@ impl Handler {
         let user_id = cmd.user.id.get();
 
         tokio::spawn(async move {
-            use std::sync::Arc;
             use tokio::io::AsyncBufReadExt;
             use tokio::process::Command as TokioCommand;
+            use std::sync::Arc;
 
             // Drop guard ensures AUTH_IN_PROGRESS is cleared even on panic.
             struct AuthGuard;
@@ -3153,15 +3099,13 @@ impl Handler {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!(error = %e, "/auth: failed to spawn auth command");
-                    let _ = http
-                        .create_followup_message(
-                            &token,
-                            &CreateInteractionResponseFollowup::new()
-                                .content(format!("❌ Failed to start auth command: {e}"))
-                                .ephemeral(true),
-                            Vec::new(),
-                        )
-                        .await;
+                    let _ = http.create_followup_message(
+                        &token,
+                        &CreateInteractionResponseFollowup::new()
+                            .content(format!("❌ Failed to start auth command: {e}"))
+                            .ephemeral(true),
+                        Vec::new(),
+                    ).await;
                     return;
                 }
             };
@@ -3180,10 +3124,7 @@ impl Handler {
                     let mut reader = tokio::io::BufReader::new(stdout).lines();
                     while let Ok(Some(line)) = reader.next_line().await {
                         let has_url = line.contains("http://") || line.contains("https://");
-                        lines_out
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push(line);
+                        lines_out.lock().unwrap_or_else(|e| e.into_inner()).push(line);
                         if has_url {
                             url_found_out.notify_one();
                         }
@@ -3198,10 +3139,7 @@ impl Handler {
                     let mut reader = tokio::io::BufReader::new(stderr).lines();
                     while let Ok(Some(line)) = reader.next_line().await {
                         let has_url = line.contains("http://") || line.contains("https://");
-                        lines_err
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push(line);
+                        lines_err.lock().unwrap_or_else(|e| e.into_inner()).push(line);
                         if has_url {
                             url_found_err.notify_one();
                         }
@@ -3231,8 +3169,12 @@ impl Handler {
             // Handle an early exit (the command terminated during the URL window).
             if let Some(res) = early_exit {
                 let _ = tokio::join!(stdout_task, stderr_task);
-                let collected =
-                    strip_ansi_codes(&lines.lock().unwrap_or_else(|e| e.into_inner()).join("\n"));
+                let collected = strip_ansi_codes(
+                    &lines
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .join("\n"),
+                );
                 let detail = if collected.trim().is_empty() {
                     String::new()
                 } else {
@@ -3252,15 +3194,13 @@ impl Handler {
                     }
                     Err(e) => format!("❌ Error waiting for auth command: {e}"),
                 };
-                let _ = http
-                    .create_followup_message(
-                        &token,
-                        &CreateInteractionResponseFollowup::new()
-                            .content(content)
-                            .ephemeral(true),
-                        Vec::new(),
-                    )
-                    .await;
+                let _ = http.create_followup_message(
+                    &token,
+                    &CreateInteractionResponseFollowup::new()
+                        .content(content)
+                        .ephemeral(true),
+                    Vec::new(),
+                ).await;
                 return;
             }
 
@@ -3291,15 +3231,13 @@ impl Handler {
             // `truncate_to_utf16_budget` for the testable implementation.
             let truncated = truncate_to_utf16_budget(&output, prefix, suffix, 2000);
             let msg = format!("{prefix}{truncated}{suffix}");
-            let _ = http
-                .create_followup_message(
-                    &token,
-                    &CreateInteractionResponseFollowup::new()
-                        .content(msg)
-                        .ephemeral(true),
-                    Vec::new(),
-                )
-                .await;
+            let _ = http.create_followup_message(
+                &token,
+                &CreateInteractionResponseFollowup::new()
+                    .content(msg)
+                    .ephemeral(true),
+                Vec::new(),
+            ).await;
 
             // Wait for the process to complete (user authorizes in browser).
             // Use 14min (not 15) to leave headroom for the Discord interaction token TTL.
@@ -3307,55 +3245,44 @@ impl Handler {
             match tokio::time::timeout(timeout, child.wait()).await {
                 Ok(Ok(status)) if status.success() => {
                     info!("/auth: authentication successful");
-                    let _ = http
-                        .create_followup_message(
-                            &token,
-                            &CreateInteractionResponseFollowup::new()
-                                .content("✅ Authentication successful!")
-                                .ephemeral(true),
-                            Vec::new(),
-                        )
-                        .await;
+                    let _ = http.create_followup_message(
+                        &token,
+                        &CreateInteractionResponseFollowup::new()
+                            .content("✅ Authentication successful!")
+                            .ephemeral(true),
+                        Vec::new(),
+                    ).await;
                 }
                 Ok(Ok(status)) => {
                     warn!(%status, "/auth: authentication failed");
-                    let _ = http
-                        .create_followup_message(
-                            &token,
-                            &CreateInteractionResponseFollowup::new()
-                                .content(format!(
-                                    "❌ Authentication failed (exit code: {}).",
-                                    status
-                                ))
-                                .ephemeral(true),
-                            Vec::new(),
-                        )
-                        .await;
+                    let _ = http.create_followup_message(
+                        &token,
+                        &CreateInteractionResponseFollowup::new()
+                            .content(format!("❌ Authentication failed (exit code: {}).", status))
+                            .ephemeral(true),
+                        Vec::new(),
+                    ).await;
                 }
                 Ok(Err(e)) => {
                     tracing::error!(error = %e, "/auth: error waiting for auth process");
-                    let _ = http
-                        .create_followup_message(
-                            &token,
-                            &CreateInteractionResponseFollowup::new()
-                                .content(format!("❌ Auth process error: {e}"))
-                                .ephemeral(true),
-                            Vec::new(),
-                        )
-                        .await;
+                    let _ = http.create_followup_message(
+                        &token,
+                        &CreateInteractionResponseFollowup::new()
+                            .content(format!("❌ Auth process error: {e}"))
+                            .ephemeral(true),
+                        Vec::new(),
+                    ).await;
                 }
                 Err(_) => {
                     warn!("/auth: timed out waiting for authorization");
                     let _ = child.kill().await;
-                    let _ = http
-                        .create_followup_message(
-                            &token,
-                            &CreateInteractionResponseFollowup::new()
-                                .content("⏰ Authentication timed out. Run `/auth` again to retry.")
-                                .ephemeral(true),
-                            Vec::new(),
-                        )
-                        .await;
+                    let _ = http.create_followup_message(
+                        &token,
+                        &CreateInteractionResponseFollowup::new()
+                            .content("⏰ Authentication timed out. Run `/auth` again to retry.")
+                            .ephemeral(true),
+                        Vec::new(),
+                    ).await;
                 }
             }
 
@@ -3402,7 +3329,9 @@ impl Handler {
                 );
                 (in_thread, gc.name.clone())
             }
-            Ok(serenity::model::channel::Channel::Private(_)) => (self.allow_dm, "dm".to_string()),
+            Ok(serenity::model::channel::Channel::Private(_)) => {
+                (self.allow_dm, "dm".to_string())
+            }
             Ok(_) => (false, "channel".to_string()),
             Err(e) => {
                 tracing::warn!(channel_id = %channel_id, error = %e, "failed to inspect channel for export");
@@ -3424,34 +3353,16 @@ impl Handler {
 
         // --- Parse and validate filter params (mutual exclusion) ---
         let opts = &cmd.data.options;
-        let limit_opt = opts
-            .iter()
-            .find(|o| o.name == "limit")
-            .and_then(|o| o.value.as_i64());
-        let since_opt = opts
-            .iter()
-            .find(|o| o.name == "since")
-            .and_then(|o| o.value.as_str());
-        let days_opt = opts
-            .iter()
-            .find(|o| o.name == "days")
-            .and_then(|o| o.value.as_i64());
-        let all_opt = opts
-            .iter()
-            .find(|o| o.name == "all")
-            .and_then(|o| o.value.as_bool())
-            .unwrap_or(false);
+        let limit_opt = opts.iter().find(|o| o.name == "limit").and_then(|o| o.value.as_i64());
+        let since_opt = opts.iter().find(|o| o.name == "since").and_then(|o| o.value.as_str());
+        let days_opt = opts.iter().find(|o| o.name == "days").and_then(|o| o.value.as_i64());
+        let all_opt = opts.iter().find(|o| o.name == "all").and_then(|o| o.value.as_bool()).unwrap_or(false);
 
-        let filter_count = limit_opt.is_some() as u8
-            + since_opt.is_some() as u8
-            + days_opt.is_some() as u8
-            + all_opt as u8;
+        let filter_count = limit_opt.is_some() as u8 + since_opt.is_some() as u8 + days_opt.is_some() as u8 + all_opt as u8;
         if filter_count > 1 {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content(
-                        "⚠️ Please specify only one filter: `limit`, `since`, `days`, or `all`.",
-                    )
+                    .content("⚠️ Please specify only one filter: `limit`, `since`, `days`, or `all`.")
                     .ephemeral(true),
             );
             let _ = cmd.create_response(&ctx.http, response).await;
@@ -4214,7 +4125,8 @@ fn format_usage_body(report: &UsageReport) -> (String, bool) {
 fn build_usage_reply(report: &UsageReport) -> (String, CreateEmbed) {
     let (body, over_limit) = format_usage_body(report);
     let content = format!("📊 **Usage — {}**\n{}", report.plan_name, body);
-    let mut embed = CreateEmbed::new().colour(if over_limit { 0xE74C3C } else { 0x2ECC71 });
+    let mut embed =
+        CreateEmbed::new().colour(if over_limit { 0xE74C3C } else { 0x2ECC71 });
     if let Some(reset) = &report.billing_cycle_reset {
         embed = embed.footer(CreateEmbedFooter::new(format!(
             "Billing cycle resets {reset}"
@@ -4384,10 +4296,7 @@ async fn export_channel_messages(
 
     let filename = export_filename(channel_id, channel_name);
     if attachment_size_limit < 2048 {
-        tracing::warn!(
-            attachment_size_limit,
-            "attachment_size_limit is very small; export will likely be truncated"
-        );
+        tracing::warn!(attachment_size_limit, "attachment_size_limit is very small; export will likely be truncated");
     }
     let max_bytes = usize::try_from(attachment_size_limit)
         .unwrap_or(8 * 1024 * 1024)
@@ -4457,7 +4366,10 @@ fn format_export_message(msg: &Message) -> String {
     let bot_marker = if msg.author.bot { " [bot]" } else { "" };
     let mut out = format!(
         "[{}] {}{} ({})\n",
-        msg.timestamp, msg.author.name, bot_marker, msg.author.id
+        msg.timestamp,
+        msg.author.name,
+        bot_marker,
+        msg.author.id
     );
 
     if msg.content.is_empty() {
@@ -4876,7 +4788,7 @@ fn truncate_to_utf16_budget(body: &str, prefix: &str, suffix: &str, limit: usize
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bot_turns::{TurnResult, BOT_TURN_LIMIT_WARNING_PREFIX, HARD_BOT_TURN_LIMIT};
+    use crate::bot_turns::{TurnResult, HARD_BOT_TURN_LIMIT, BOT_TURN_LIMIT_WARNING_PREFIX};
 
     fn test_elicitation_state(choice_count: usize) -> DiscordElicitationState {
         let choices: Vec<serde_json::Value> = (0..choice_count)
@@ -5081,10 +4993,7 @@ mod tests {
         assert!(content.contains("12781.64 / 10000"));
         assert!(content.contains("Overage charges: 111.27 USD"));
         let json = serde_json::to_value(&embed).expect("embed serializes");
-        assert!(
-            json.get("description").is_none(),
-            "body must not be in embed"
-        );
+        assert!(json.get("description").is_none(), "body must not be in embed");
         assert!(json.get("title").is_none(), "title must not be in embed");
         assert_eq!(json["color"], 0xE74C3C, "over limit → red strip");
         assert_eq!(json["footer"]["text"], "Billing cycle resets 2026-08-01");
@@ -5146,10 +5055,7 @@ mod tests {
     #[test]
     fn truncate_utf16_respects_prefix_suffix_budget() {
         // limit 10, prefix "pre" (3) + suffix "su" (2) = 5 → 5 ASCII units left.
-        assert_eq!(
-            truncate_to_utf16_budget("abcdefghij", "pre", "su", 10),
-            "abcde"
-        );
+        assert_eq!(truncate_to_utf16_budget("abcdefghij", "pre", "su", 10), "abcde");
     }
 
     /// A supplementary-plane scalar counts as TWO UTF-16 code units, not one.
@@ -6042,8 +5948,9 @@ mod tests {
         trusted_bot_ids: &HashSet<u64>,
         author_id: u64,
     ) -> bool {
-        let trusted_mention =
-            is_mentioned && !trusted_bot_ids.is_empty() && trusted_bot_ids.contains(&author_id);
+        let trusted_mention = is_mentioned
+            && !trusted_bot_ids.is_empty()
+            && trusted_bot_ids.contains(&author_id);
 
         if !trusted_mention {
             match allow_bot_messages {
@@ -6076,12 +5983,7 @@ mod tests {
     #[test]
     fn bot_admission_untrusted_mention_blocked_by_off() {
         let trusted = HashSet::from([42]);
-        assert!(!should_admit_bot_message(
-            AllowBots::Off,
-            true,
-            &trusted,
-            99
-        ));
+        assert!(!should_admit_bot_message(AllowBots::Off, true, &trusted, 99));
     }
 
     /// GIVEN: allow_bot_messages=Off, trusted bot without @mention
@@ -6089,12 +5991,7 @@ mod tests {
     #[test]
     fn bot_admission_trusted_no_mention_blocked_by_off() {
         let trusted = HashSet::from([42]);
-        assert!(!should_admit_bot_message(
-            AllowBots::Off,
-            false,
-            &trusted,
-            42
-        ));
+        assert!(!should_admit_bot_message(AllowBots::Off, false, &trusted, 42));
     }
 
     /// GIVEN: allow_bot_messages=Off, empty trusted_bot_ids, bot @mentions
@@ -6102,12 +5999,7 @@ mod tests {
     #[test]
     fn bot_admission_empty_trusted_ids_off_mode() {
         let trusted: HashSet<u64> = HashSet::new();
-        assert!(!should_admit_bot_message(
-            AllowBots::Off,
-            true,
-            &trusted,
-            42
-        ));
+        assert!(!should_admit_bot_message(AllowBots::Off, true, &trusted, 42));
     }
 
     /// GIVEN: allow_bot_messages=Mentions, trusted bot @mentions
@@ -6115,12 +6007,7 @@ mod tests {
     #[test]
     fn bot_admission_mentions_mode_trusted_mention() {
         let trusted = HashSet::from([42]);
-        assert!(should_admit_bot_message(
-            AllowBots::Mentions,
-            true,
-            &trusted,
-            42
-        ));
+        assert!(should_admit_bot_message(AllowBots::Mentions, true, &trusted, 42));
     }
 
     /// GIVEN: allow_bot_messages=All, untrusted bot (not in trusted_bot_ids)
@@ -6128,12 +6015,7 @@ mod tests {
     #[test]
     fn bot_admission_all_mode_untrusted_bot_rejected() {
         let trusted = HashSet::from([42]);
-        assert!(!should_admit_bot_message(
-            AllowBots::All,
-            false,
-            &trusted,
-            99
-        ));
+        assert!(!should_admit_bot_message(AllowBots::All, false, &trusted, 99));
     }
 
     // --- DM gating tests (#656) ---
@@ -6223,28 +6105,19 @@ mod tests {
 
     #[test]
     fn dedup_detects_existing_bot_warning() {
-        let msg = format!(
-            "{} (20/20). A human must reply.",
-            BOT_TURN_LIMIT_WARNING_PREFIX
-        );
+        let msg = format!("{} (20/20). A human must reply.", BOT_TURN_LIMIT_WARNING_PREFIX);
         assert!(turn_limit_warning_present(&[(true, &msg)]));
     }
 
     #[test]
     fn dedup_ignores_human_warning_text() {
-        let msg = format!(
-            "{} (20/20). A human must reply.",
-            BOT_TURN_LIMIT_WARNING_PREFIX
-        );
+        let msg = format!("{} (20/20). A human must reply.", BOT_TURN_LIMIT_WARNING_PREFIX);
         assert!(!turn_limit_warning_present(&[(false, &msg)]));
     }
 
     #[test]
     fn dedup_returns_false_when_no_warning() {
-        assert!(!turn_limit_warning_present(&[
-            (true, "hello"),
-            (false, "world")
-        ]));
+        assert!(!turn_limit_warning_present(&[(true, "hello"), (false, "world")]));
     }
 
     #[test]
@@ -6261,10 +6134,7 @@ mod tests {
     fn reaction_mentions_mode_always_rejected() {
         assert!(!should_process_reaction(
             AllowUsers::Mentions,
-            true,
-            true,
-            false,
-            false,
+            true, true, false, false,
         ));
     }
 
@@ -6276,8 +6146,7 @@ mod tests {
             AllowUsers::Involved,
             false, // is_thread
             false, // bot_involved (irrelevant for non-thread)
-            false,
-            false,
+            false, false,
         ));
     }
 
@@ -6289,8 +6158,7 @@ mod tests {
             AllowUsers::Involved,
             true,  // is_thread
             false, // bot_involved
-            false,
-            false,
+            false, false,
         ));
     }
 
@@ -6302,8 +6170,7 @@ mod tests {
             AllowUsers::Involved,
             true, // is_thread
             true, // bot_involved
-            false,
-            false,
+            false, false,
         ));
     }
 
@@ -6353,9 +6220,7 @@ mod tests {
         assert!(!should_process_reaction(
             AllowUsers::MultibotMentions,
             false, // is_thread
-            false,
-            false,
-            false,
+            false, false, false,
         ));
     }
 }

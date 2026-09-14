@@ -97,6 +97,7 @@ pub struct AppState {
     pub client: reqwest::Client,
 }
 
+
 impl AppState {
     /// Create a minimal AppState for testing. Only requires an `event_tx` sender;
     /// all adapter fields default to `None`/empty. This decouples adapter tests
@@ -140,11 +141,9 @@ impl AppState {
             event_tx,
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
-            lineworks_webhook_semaphore: Arc::new(Semaphore::new(
-                LINEWORKS_WEBHOOK_CONCURRENCY_MAX,
-            )),
-            lineworks_ingress_queue: Arc::new(Semaphore::new(LINEWORKS_INGRESS_QUEUE_MAX)),
-            trust_probe: None,
+        lineworks_webhook_semaphore: Arc::new(Semaphore::new(LINEWORKS_WEBHOOK_CONCURRENCY_MAX)),
+        lineworks_ingress_queue: Arc::new(Semaphore::new(LINEWORKS_INGRESS_QUEUE_MAX)),
+        trust_probe: None,
             client: reqwest::Client::new(),
         }
     }
@@ -185,8 +184,8 @@ impl AppState {
 
         // Feishu
         #[cfg(feature = "feishu")]
-        let feishu =
-            adapters::feishu::FeishuConfig::from_env().map(adapters::feishu::FeishuAdapter::new);
+        let feishu = adapters::feishu::FeishuConfig::from_env()
+            .map(adapters::feishu::FeishuAdapter::new);
 
         // Google Chat
         #[cfg(feature = "googlechat")]
@@ -207,20 +206,16 @@ impl AppState {
 
         // WeCom
         #[cfg(feature = "wecom")]
-        let wecom =
-            adapters::wecom::WecomConfig::from_env().map(adapters::wecom::WecomAdapter::new);
+        let wecom = adapters::wecom::WecomConfig::from_env()
+            .map(adapters::wecom::WecomAdapter::new);
 
         // ACP Server
         #[cfg(feature = "acp")]
         let acp = adapters::acp_server::AcpConfig::from_env();
         #[cfg(feature = "acp")]
-        let acp_reply_registry = acp
-            .as_ref()
-            .map(|_| adapters::acp_server::new_reply_registry());
+        let acp_reply_registry = acp.as_ref().map(|_| adapters::acp_server::new_reply_registry());
         #[cfg(feature = "acp")]
-        let acp_tunnel_registry = acp
-            .as_ref()
-            .map(|_| adapters::acp_server::new_tunnel_registry());
+        let acp_tunnel_registry = acp.as_ref().map(|_| adapters::acp_server::new_tunnel_registry());
         // LINE WORKS
         #[cfg(feature = "lineworks")]
         let lineworks = adapters::lineworks::LineWorksConfig::from_env().map(|config| {
@@ -265,11 +260,9 @@ impl AppState {
             event_tx,
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
-            lineworks_webhook_semaphore: Arc::new(Semaphore::new(
-                LINEWORKS_WEBHOOK_CONCURRENCY_MAX,
-            )),
-            lineworks_ingress_queue: Arc::new(Semaphore::new(LINEWORKS_INGRESS_QUEUE_MAX)),
-            trust_probe: None,
+        lineworks_webhook_semaphore: Arc::new(Semaphore::new(LINEWORKS_WEBHOOK_CONCURRENCY_MAX)),
+        lineworks_ingress_queue: Arc::new(Semaphore::new(LINEWORKS_INGRESS_QUEUE_MAX)),
+        trust_probe: None,
             client,
         }
     }
@@ -429,12 +422,7 @@ impl AppState {
     /// no adapter, matching env-only semantics.
     #[cfg(feature = "wecom")]
     pub fn apply_wecom_config(&mut self, cfg: GatewayWecomConfig) {
-        let streaming = if cfg.streaming_enabled {
-            "true"
-        } else {
-            "false"
-        }
-        .to_string();
+        let streaming = if cfg.streaming_enabled { "true" } else { "false" }.to_string();
         let debounce = cfg.debounce_secs.to_string();
         self.wecom = adapters::wecom::WecomConfig::from_reader(|k| match k {
             "WECOM_CORP_ID" => cfg.corp_id.clone(),
@@ -613,16 +601,10 @@ impl Default for ServeConfig {
 /// Start the standalone gateway server. This is the main entry point extracted
 /// from the gateway binary — the binary becomes a thin wrapper around this.
 pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
-    use axum::{
-        routing::{get, post},
-        Router,
-    };
+    use axum::{routing::{get, post}, Router};
     use tracing::{info, warn};
 
-    let ServeConfig {
-        listen_addr,
-        ws_token,
-    } = config;
+    let ServeConfig { listen_addr, ws_token } = config;
 
     if ws_token.is_none() {
         warn!("GATEWAY_WS_TOKEN not set — WebSocket connections are NOT authenticated (insecure)");
@@ -638,10 +620,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     // ACP Server adapter. Fail-open (no transport key) is only allowed on a loopback
     // bind; a non-loopback bind without OPENAB_ACP_AUTH_KEY refuses to mount /acp.
     #[cfg(feature = "acp")]
-    if std::env::var("OPENAB_ACP_ENABLED")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false)
-    {
+    if std::env::var("OPENAB_ACP_ENABLED").map(|v| v == "true" || v == "1").unwrap_or(false) {
         let acp_key = std::env::var("OPENAB_ACP_AUTH_KEY").ok();
         match adapters::acp_server::acp_auth_ok_for_bind(acp_key.as_deref(), &listen_addr) {
             Ok(()) => {
@@ -753,11 +732,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
             let api_base = f.config.api_base();
             let idle_ms = f.config.card_idle_finalize_ms;
             tokio::spawn(adapters::feishu::run_idle_reaper(
-                sessions,
-                token_cache,
-                client,
-                api_base,
-                idle_ms,
+                sessions, token_cache, client, api_base, idle_ms,
             ));
             info!(idle_ms, "feishu card-streaming idle reaper started");
         }
@@ -765,8 +740,8 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
 
     // Google Chat adapter
     #[cfg(feature = "googlechat")]
-    let googlechat_webhook_path =
-        std::env::var("GOOGLE_CHAT_WEBHOOK_PATH").unwrap_or_else(|_| "/webhook/googlechat".into());
+    let googlechat_webhook_path = std::env::var("GOOGLE_CHAT_WEBHOOK_PATH")
+        .unwrap_or_else(|_| "/webhook/googlechat".into());
     #[cfg(feature = "googlechat")]
     let google_chat = {
         let enabled = std::env::var("GOOGLE_CHAT_ENABLED")
@@ -774,10 +749,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
             .unwrap_or(false);
         if enabled {
             info!(path = %googlechat_webhook_path, "googlechat adapter enabled");
-            app = app.route(
-                &googlechat_webhook_path,
-                post(adapters::googlechat::webhook),
-            );
+            app = app.route(&googlechat_webhook_path, post(adapters::googlechat::webhook));
             Some(adapters::googlechat::GoogleChatAdapter::from_parts(
                 adapters::googlechat::GoogleChatParts::from_env(),
             ))
@@ -907,11 +879,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
                 cache.retain(|_, (_, t)| t.elapsed().as_secs() < REPLY_TOKEN_TTL_SECS);
                 let after = cache.len();
                 if before != after {
-                    info!(
-                        removed = before - after,
-                        remaining = after,
-                        "reply token cache sweep"
-                    );
+                    info!(removed = before - after, remaining = after, "reply token cache sweep");
                 }
             }
         });
@@ -928,11 +896,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
                 urls.retain(|_, (_, t)| t.elapsed().as_secs() < 4 * 3600);
                 let after = urls.len();
                 if before != after {
-                    info!(
-                        removed = before - after,
-                        remaining = after,
-                        "teams service_url cache cleanup"
-                    );
+                    info!(removed = before - after, remaining = after, "teams service_url cache cleanup");
                 }
             }
         });
@@ -1133,7 +1097,9 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                             "lineworks" => {
                                 if let Some(ref lineworks) = state_for_recv.lineworks {
                                     let ok = adapters::lineworks::dispatch_lineworks_reply(
-                                        &client, lineworks, &reply,
+                                        &client,
+                                        lineworks,
+                                        &reply,
                                     )
                                     .await;
                                     if !ok {

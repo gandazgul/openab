@@ -1251,7 +1251,8 @@ mod tests {
             tokio::spawn(async move {
                 // Concurrent task refreshes the token (as a successful
                 // get_token re-exchange would).
-                *cache.token.write().await = Some(("tok_new".to_string(), Instant::now(), 3600));
+                *cache.token.write().await =
+                    Some(("tok_new".to_string(), Instant::now(), 3600));
                 barrier.wait().await;
             })
         };

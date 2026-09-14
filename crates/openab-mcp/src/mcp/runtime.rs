@@ -2927,10 +2927,7 @@ mod tests {
                 custom_headers,
             )
             .await;
-        assert!(
-            result.is_err(),
-            "redirect response must not complete MCP POST"
-        );
+        assert!(result.is_err(), "redirect response must not complete MCP POST");
         assert_eq!(
             *original_headers.lock().await,
             (
@@ -3072,10 +3069,7 @@ mod tests {
                 assert!(err.contains(header_name), "got: {err}");
                 assert!(!err.contains("secret-must-not-leak"), "value leaked: {err}");
                 assert!(!err.contains("circuit-breaker open"), "got: {err}");
-                assert!(matches!(
-                    &mgr.statuses().await[0].1,
-                    ServerStatus::Failed(_)
-                ));
+                assert!(matches!(&mgr.statuses().await[0].1, ServerStatus::Failed(_)));
             }
         }
     }
@@ -3102,10 +3096,7 @@ mod tests {
             !err.contains("custom-secret-must-not-leak"),
             "header value leaked: {err}"
         );
-        assert!(matches!(
-            &mgr.statuses().await[0].1,
-            ServerStatus::Failed(_)
-        ));
+        assert!(matches!(&mgr.statuses().await[0].1, ServerStatus::Failed(_)));
     }
 
     #[tokio::test]
