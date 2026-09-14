@@ -19,9 +19,14 @@ affectedPaths:
 executionAgent: "engineer"
 collaborationRecommendation: "autonomous"
 createdAt: "2026-09-08"
-status: "validated_reviewer"
+status: "validated"
 origin: "internal"
 userVerifiedAt: null
+workRecord:
+  status: "generated"
+  recordId: "35c6e3f4-66ea-439f-83c1-eadee32f3d22"
+  path: "docs/work-records/2026-09-14-discord-acp-form-elicitation.md"
+  lastAttemptAt: "2026-09-14T18:38:29.097Z"
 routingIntent: "PLANNED_CHANGE"
 targetBranch: "main"
 ---
