@@ -196,6 +196,7 @@ pub struct AcpConnection {
     generation: ConnectionGeneration,
     elicitation: Arc<ElicitationCoordinator>,
     elicitation_turn: Arc<Mutex<Option<ElicitationTurnContext>>>,
+    form_presented: Arc<AtomicBool>,
     form_presenter: Option<Arc<dyn FormPresenter>>,
     agent_name_shared: Arc<Mutex<String>>,
     _reader_handle: JoinHandle<()>,
@@ -248,6 +249,7 @@ pub(crate) struct ReaderLoopContext<W> {
     elicitation: Arc<ElicitationCoordinator>,
     generation: ConnectionGeneration,
     elicitation_turn: Arc<Mutex<Option<ElicitationTurnContext>>>,
+    form_presented: Arc<AtomicBool>,
     form_presenter: Option<Arc<dyn FormPresenter>>,
     agent_name: Arc<Mutex<String>>,
 }
@@ -264,6 +266,7 @@ where
         elicitation,
         generation,
         elicitation_turn,
+        form_presented,
         form_presenter,
         agent_name,
     } = ctx;
@@ -383,6 +386,7 @@ where
                         }
                     }
                     ElicitationStart::Present(lease) => {
+                        form_presented.store(true, Ordering::Release);
                         let writer = writer.clone();
                         let elicitation = elicitation.clone();
                         tokio::spawn(async move {
@@ -688,6 +692,7 @@ impl AcpConnection {
         let elicitation = ElicitationCoordinator::new();
         let generation = ConnectionGeneration::new();
         let elicitation_turn = Arc::new(Mutex::new(None));
+        let form_presented = Arc::new(AtomicBool::new(false));
         let agent_name_shared = Arc::new(Mutex::new(command.to_string()));
 
         let reader_handle = tokio::spawn(run_reader_loop(
@@ -699,6 +704,7 @@ impl AcpConnection {
                 elicitation: elicitation.clone(),
                 generation,
                 elicitation_turn: elicitation_turn.clone(),
+                form_presented: form_presented.clone(),
                 form_presenter: form_presenter.clone(),
                 agent_name: agent_name_shared.clone(),
             },
@@ -723,6 +729,7 @@ impl AcpConnection {
             generation,
             elicitation,
             elicitation_turn,
+            form_presented,
             form_presenter,
             agent_name_shared,
             _reader_handle: reader_handle,
@@ -974,6 +981,7 @@ impl AcpConnection {
         self.last_active = Instant::now();
         self.activity.touch();
         self.activity.set_in_flight(true);
+        self.form_presented.store(false, Ordering::Release);
 
         let session_id = self
             .acp_session_id
@@ -1022,6 +1030,11 @@ impl AcpConnection {
             return Err(err);
         }
         Ok((rx, id))
+    }
+
+    /// Whether the current turn admitted a form, creating a separate chat message.
+    pub(crate) fn form_presented(&self) -> bool {
+        self.form_presented.load(Ordering::Acquire)
     }
 
     /// Call after prompt streaming is done to clean up subscriber.
@@ -1308,6 +1321,7 @@ mod reader_loop_tests {
             elicitation: ElicitationCoordinator::new(),
             generation: ConnectionGeneration::new(),
             elicitation_turn: Arc::new(Mutex::new(None)),
+            form_presented: Arc::new(AtomicBool::new(false)),
             form_presenter: None,
             agent_name: Arc::new(Mutex::new(String::new())),
         }

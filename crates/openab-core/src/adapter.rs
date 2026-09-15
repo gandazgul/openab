@@ -806,7 +806,7 @@ impl AdapterRouter {
                     const NATIVE_FLUSH_MS: u128 = 400;
 
                     // Streaming edit: send placeholder, spawn edit loop
-                    let (buf_tx, placeholder_msg, edit_handle) = if streaming && !native {
+                    let (buf_tx, mut placeholder_msg, edit_handle) = if streaming && !native {
                         let initial = if reset {
                             "⚠️ _Session expired, starting fresh..._\n\n…".to_string()
                         } else {
@@ -1004,7 +1004,7 @@ impl AdapterRouter {
                                         let _ = tx.send(display_for(
                                             platform_is_acp,
                                             &tool_lines,
-                                            &text_buf,
+                                            if conn.form_presented() { "" } else { &text_buf },
                                             true,
                                             tool_display,
                                         ));
@@ -1054,7 +1054,7 @@ impl AdapterRouter {
                                         let _ = tx.send(display_for(
                                             platform_is_acp,
                                             &tool_lines,
-                                            &text_buf,
+                                            if conn.form_presented() { "" } else { &text_buf },
                                             true,
                                             tool_display,
                                         ));
@@ -1100,7 +1100,7 @@ impl AdapterRouter {
                                         let _ = tx.send(display_for(
                                             platform_is_acp,
                                             &tool_lines,
-                                            &text_buf,
+                                            if conn.form_presented() { "" } else { &text_buf },
                                             true,
                                             tool_display,
                                         ));
@@ -1155,6 +1155,39 @@ impl AdapterRouter {
                     // encodes the four-corner truth table so it can be unit-tested.
                     let text_buf = finalize_body(reset, keep_full_text, answer_start, text_buf);
 
+                    // A form is a separate message after the progress placeholder.
+                    // Keep that placeholder for tool status, then deliver narration
+                    // below the form so the answer does not appear above its question.
+                    let mut delivery_failed = false;
+                    if conn.form_presented() && !text_buf.trim().is_empty() {
+                        if let Some(msg) = placeholder_msg.take() {
+                            let progress = display_for(
+                                platform_is_acp, &tool_lines, "", false, tool_display,
+                            );
+                            if msg.message_id != "draft" {
+                                if progress.is_empty() {
+                                    if let Err(e) = adapter.delete_message(&msg).await {
+                                        tracing::warn!(error = ?e, "form progress placeholder deletion failed");
+                                        delivery_failed = true;
+                                    }
+                                } else {
+                                    for (index, chunk) in format::split_message(&progress, message_limit).iter().enumerate() {
+                                        let result = if index == 0 {
+                                            adapter.edit_message(&msg, chunk).await
+                                        } else {
+                                            adapter.send_message(&thread_channel, chunk).await.map(|_| ())
+                                        };
+                                        if let Err(e) = result {
+                                            tracing::warn!(error = ?e, "form progress finalization failed");
+                                            delivery_failed = true;
+                                        }
+                                    }
+                                }
+                            }
+                            tool_lines.clear();
+                        }
+                    }
+
                     // Build final content
                     let final_content =
                         display_for(platform_is_acp, &tool_lines, &text_buf, false, tool_display);
@@ -1191,7 +1224,6 @@ impl AdapterRouter {
                     // here means the user's view is incomplete; we propagate Err at the
                     // end of the closure so dispatch surfaces set_error (❌) instead of
                     // silently calling set_done (🆗) over a half-delivered turn.
-                    let mut delivery_failed = false;
                     // Clear the assistant status line before delivering the final message.
                     if assistant_status {
                         let _ = adapter.set_status(&thread_channel, "").await;

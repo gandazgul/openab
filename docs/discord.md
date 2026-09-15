@@ -183,6 +183,8 @@ OpenAB supports flat ACP form schemas with these field types:
 
 The form is progressive. Users answer one field at a time, review the values, can modify fields, and then choose **Submit**, **Decline**, or **Cancel**. Long form text is split into pages so the prompt, descriptions, choices, defaults, errors, and review values stay visible in Discord. If a Discord select cannot safely represent a field, OpenAB asks the user to reply directly to the form message with the value. Other messages continue through normal dispatch. Replies to inactive forms or from unauthorized users receive a notice and are not sent to the agent. If OpenAB cannot retrieve a reply target to check whether it is a form, it also withholds the reply and sends a notice. Send a new message, not a reply, for a normal request.
 
+After a form, OpenAB sends the agent’s completed reply as a new message below the form. The earlier streaming message keeps the tool status; it does not gain the answer above the question.
+
 In text fallback, reply directly to the active form message. You can type the value for the current field, or use these commands:
 
 - `!form next` / `!form prev` — move through display pages.

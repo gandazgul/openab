@@ -222,6 +222,7 @@ fn trigger_message() -> MessageRef {
 struct TestAdapter {
     presenter: Arc<dyn FormPresenter>,
     sent_tx: mpsc::UnboundedSender<String>,
+    edited_tx: Option<mpsc::UnboundedSender<String>>,
 }
 
 #[async_trait]
@@ -250,6 +251,13 @@ impl ChatAdapter for TestAdapter {
         })
     }
 
+    async fn edit_message(&self, _msg: &MessageRef, content: &str) -> anyhow::Result<()> {
+        if let Some(tx) = &self.edited_tx {
+            let _ = tx.send(content.to_string());
+        }
+        Ok(())
+    }
+
     async fn create_thread(
         &self,
         channel: &ChannelRef,
@@ -268,7 +276,7 @@ impl ChatAdapter for TestAdapter {
     }
 
     fn use_streaming(&self, _other_bot_present: bool) -> bool {
-        false
+        self.edited_tx.is_some()
     }
 }
 
@@ -623,6 +631,99 @@ async fn abandon_request_invalidates_pending_elicitation() {
 }
 
 #[tokio::test]
+async fn streaming_reply_is_sent_after_form_and_next_turn_resumes_normal_editing() {
+    for outcome in [
+        ElicitationOutcome::Accept(json!({"name":"purple"}).as_object().unwrap().clone()),
+        ElicitationOutcome::Cancel,
+        ElicitationOutcome::Decline,
+    ] {
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+        let (outcome_tx, outcome_rx) = mpsc::unbounded_channel();
+        let (expired_tx, _expired_rx) = mpsc::unbounded_channel();
+        let presenter = Arc::new(RecordingPresenter {
+            seen_tx,
+            outcome_rx: Arc::new(Mutex::new(outcome_rx)),
+            expired_tx,
+        });
+        let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
+        let (edited_tx, mut edited_rx) = mpsc::unbounded_channel();
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(TestAdapter {
+            presenter,
+            sent_tx,
+            edited_tx: Some(edited_tx),
+        });
+        let pool = Arc::new(SessionPool::new(
+            fake_agent_config("streaming_form").unwrap(),
+            1,
+            30,
+            HashMap::new(),
+        ));
+        let router = Arc::new(AdapterRouter::new(
+            pool,
+            test_reactions_config(),
+            TableMode::Off,
+            10,
+            1,
+            HashMap::new(),
+            std::path::PathBuf::from("."),
+        ));
+        let context = || MessageContext {
+            thread_channel: channel(),
+            sender_json: json!({"sender_id":"user-a"}).to_string(),
+            prompt: "hello".to_string(),
+            extra_blocks: vec![],
+            trigger_msg: trigger_message(),
+            other_bot_present: false,
+        };
+        let task = {
+            let router = router.clone();
+            let adapter = adapter.clone();
+            let context = context();
+            tokio::spawn(async move { router.handle_message(&adapter, context).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), seen_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let placeholder = sent_rx.recv().await.unwrap();
+        assert!(!placeholder.contains("done"));
+        assert!(sent_rx.try_recv().is_err(), "answer must wait for the form");
+        outcome_tx.send(outcome).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let reply = sent_rx.try_recv().unwrap();
+        assert!(reply.ends_with("done"), "{reply}");
+        assert!(!reply.contains("ask_question"));
+        assert!(sent_rx.try_recv().is_err());
+        let mut edits = Vec::new();
+        while let Ok(edit) = edited_rx.try_recv() {
+            edits.push(edit);
+        }
+        assert!(edits.last().unwrap().contains("✅"));
+        assert!(edits.last().unwrap().contains("ask_question"));
+        assert!(
+            edits.iter().all(|edit| !edit.contains("done")),
+            "post-form answer must never be edited into the earlier tool message: {edits:?}"
+        );
+
+        router.handle_message(&adapter, context()).await.unwrap();
+        assert!(!sent_rx.try_recv().unwrap().contains("follow-up"));
+        assert!(
+            sent_rx.try_recv().is_err(),
+            "ordinary next turn must reuse its placeholder"
+        );
+        let mut edits = Vec::new();
+        while let Ok(edit) = edited_rx.try_recv() {
+            edits.push(edit);
+        }
+        assert_eq!(edits.last().unwrap(), "follow-up");
+    }
+}
+
+#[tokio::test]
 async fn prompt_deadline_cleanup_invalidates_pending_elicitation() {
     let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
     let (_outcome_tx, outcome_rx) = mpsc::unbounded_channel();
@@ -633,7 +734,11 @@ async fn prompt_deadline_cleanup_invalidates_pending_elicitation() {
         expired_tx,
     });
     let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
-    let adapter: Arc<dyn ChatAdapter> = Arc::new(TestAdapter { presenter, sent_tx });
+    let adapter: Arc<dyn ChatAdapter> = Arc::new(TestAdapter {
+        presenter,
+        sent_tx,
+        edited_tx: None,
+    });
     let pool = Arc::new(SessionPool::new(
         fake_agent_config("deadline_hang").unwrap(),
         1,
@@ -982,6 +1087,26 @@ fn run_fake_agent(scenario: &str) {
     }
 
     match scenario {
+        "streaming_form" => {
+            notify(
+                &mut out,
+                json!({"jsonrpc":"2.0","method":"session/update","params":{
+                    "sessionId":"sess-test","update":{"sessionUpdate":"tool_call",
+                    "toolCallId":"question","title":"ask_question","status":"in_progress"}
+                }}),
+            );
+            request_elicitation(&mut out, json!("question"), small_schema());
+            let result = read_json(&mut lines);
+            assert_eq!(result["id"], "question");
+            assert!(result.get("error").is_none(), "{result}");
+            notify(
+                &mut out,
+                json!({"jsonrpc":"2.0","method":"session/update","params":{
+                    "sessionId":"sess-test","update":{"sessionUpdate":"tool_call_update",
+                    "toolCallId":"question","status":"completed"}
+                }}),
+            );
+        }
         "other_follow_up" => {
             for (id, schema, answer) in [
                 (
@@ -1082,6 +1207,22 @@ fn run_fake_agent(scenario: &str) {
         }),
     );
     respond(&mut out, prompt_id, json!({"stopReason": "end_turn"}));
+    if scenario == "streaming_form" {
+        let follow_up = read_json(&mut lines);
+        assert_eq!(follow_up["method"], "session/prompt");
+        notify(
+            &mut out,
+            json!({"jsonrpc":"2.0","method":"session/update","params":{
+                "sessionId":"sess-test","update":{"sessionUpdate":"agent_message_chunk",
+                "content":{"type":"text","text":"follow-up"}}
+            }}),
+        );
+        respond(
+            &mut out,
+            follow_up["id"].clone(),
+            json!({"stopReason":"end_turn"}),
+        );
+    }
 }
 
 fn read_json(lines: &mut impl Iterator<Item = std::io::Result<String>>) -> Value {
