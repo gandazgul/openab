@@ -439,6 +439,9 @@ where
                                 Ok(outcome) => jsonrpc_success(id, outcome.to_result_value()),
                                 Err(err) => jsonrpc_error(id, err),
                             };
+                            // The next question may arrive as soon as the Agent reads this reply.
+                            // Release admission before publishing it; Discord message cleanup is cosmetic.
+                            elicitation.finish_generation(generation, &nonce).await;
                             let delivered = if let Ok(data) = serde_json::to_string(&envelope) {
                                 write_json_line(writer, data).await.is_ok()
                             } else {
@@ -446,17 +449,9 @@ where
                             };
                             if !delivered {
                                 status = ElicitationStatus::Expired;
-                                warn!("failed to write elicitation response; expiring generation");
-                                elicitation
-                                    .expire_generation_nonce(
-                                        generation,
-                                        &nonce,
-                                        ElicitationOutcome::Cancel,
-                                    )
-                                    .await;
+                                warn!("failed to write elicitation response");
                             }
                             let _ = presenter.expire_form(&nonce, status).await;
-                            elicitation.finish_generation(generation, &nonce).await;
                         });
                     }
                 }

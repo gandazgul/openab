@@ -42,6 +42,166 @@ impl FormPresenter for RecordingPresenter {
     }
 }
 
+struct SlowCleanupPresenter {
+    inner: RecordingPresenter,
+    cleanup: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait]
+impl FormPresenter for SlowCleanupPresenter {
+    async fn present_form(
+        &self,
+        presentation: ElicitationPresentation,
+    ) -> anyhow::Result<ElicitationOutcome> {
+        self.inner.present_form(presentation).await
+    }
+
+    async fn expire_form(&self, nonce: &str, status: ElicitationStatus) {
+        self.inner.expire_form(nonce, status).await;
+        let _permit = self.cleanup.acquire().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn other_follow_up_opens_while_previous_discord_message_is_still_updating() {
+    let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+    let (outcome_tx, outcome_rx) = mpsc::unbounded_channel();
+    let (expired_tx, mut expired_rx) = mpsc::unbounded_channel();
+    let cleanup = Arc::new(tokio::sync::Semaphore::new(0));
+    let presenter = Arc::new(SlowCleanupPresenter {
+        inner: RecordingPresenter {
+            seen_tx,
+            outcome_rx: Arc::new(Mutex::new(outcome_rx)),
+            expired_tx,
+        },
+        cleanup: cleanup.clone(),
+    });
+    let mut conn = spawn_fake("other_follow_up", Some(presenter))
+        .await
+        .unwrap();
+    conn.initialize().await.unwrap();
+    conn.session_new(".").await.unwrap();
+    let (mut rx, request_id) = conn
+        .session_prompt(
+            vec![ContentBlock::Text {
+                text: "Choose a color".into(),
+            }],
+            Some(ElicitationContext {
+                channel: channel(),
+                trigger_message: trigger_message(),
+                authorized_user_ids: HashSet::from(["user-a".to_string()]),
+            }),
+        )
+        .await
+        .unwrap();
+    for answer in ["other", "purple"] {
+        let presentation = tokio::time::timeout(std::time::Duration::from_secs(2), seen_rx.recv())
+            .await
+            .expect("the next form must not wait for Discord cleanup")
+            .unwrap();
+        assert!(presentation.form.field("answer").is_some());
+        outcome_tx
+            .send(ElicitationOutcome::Accept(serde_json::Map::from_iter([(
+                "answer".into(),
+                json!(answer),
+            )])))
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), expired_rx.recv())
+                .await
+                .unwrap(),
+            Some(ElicitationStatus::Submitted),
+        );
+    }
+    cleanup.add_permits(2);
+    loop {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if message.id.as_ref().and_then(|id| id.as_u64()) == Some(request_id) {
+            assert_eq!(message.result.unwrap()["stopReason"], "end_turn");
+            break;
+        }
+    }
+    conn.prompt_done().await;
+    assert_eq!(conn.pending_elicitations().await, 0);
+}
+
+#[tokio::test]
+async fn simultaneous_form_completion_settles_prompt_and_allows_follow_up() {
+    for outcome in [ElicitationOutcome::Cancel, ElicitationOutcome::Decline] {
+        let (status_tx, mut status_rx) = mpsc::unbounded_channel();
+        let expected_status = match outcome {
+            ElicitationOutcome::Decline => ElicitationStatus::Declined,
+            _ => ElicitationStatus::Cancelled,
+        };
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+        let (outcome_tx, outcome_rx) = mpsc::unbounded_channel();
+        let presenter = Arc::new(RecordingPresenter {
+            seen_tx,
+            outcome_rx: Arc::new(Mutex::new(outcome_rx)),
+            expired_tx: status_tx,
+        });
+        let mut conn = spawn_fake("completion_follow_up", Some(presenter))
+            .await
+            .unwrap();
+        conn.initialize().await.unwrap();
+        conn.session_new(".").await.unwrap();
+        // Exercise both ready branches repeatedly and verify reuse of this same session.
+        for _ in 0..16 {
+            let (mut rx, request_id) = conn
+                .session_prompt(
+                    vec![ContentBlock::Text {
+                        text: "hello".into(),
+                    }],
+                    Some(ElicitationContext {
+                        channel: channel(),
+                        trigger_message: trigger_message(),
+                        authorized_user_ids: HashSet::from(["user-a".to_string()]),
+                    }),
+                )
+                .await
+                .unwrap();
+            let presentation =
+                tokio::time::timeout(std::time::Duration::from_secs(2), seen_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let (coordinator, generation) = conn.elicitation_handle();
+            coordinator
+                .resolve(
+                    generation,
+                    &presentation.nonce,
+                    "user-a",
+                    &channel(),
+                    None,
+                    outcome.clone(),
+                )
+                .await
+                .unwrap();
+            // Discord resolves the coordinator and its presentation together.
+            outcome_tx.send(outcome.clone()).unwrap();
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("form completion must release the prompt")
+                .unwrap();
+            assert_eq!(
+                reply.id.as_ref().and_then(|id| id.as_u64()),
+                Some(request_id)
+            );
+            assert_eq!(reply.result.unwrap()["stopReason"], "end_turn");
+            let status = tokio::time::timeout(std::time::Duration::from_secs(2), status_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(status, expected_status);
+            conn.prompt_done().await;
+            assert_eq!(conn.pending_elicitations().await, 0);
+        }
+    }
+}
+
 fn channel() -> ChannelRef {
     ChannelRef {
         platform: "discord".into(),
@@ -796,7 +956,52 @@ fn run_fake_agent(scenario: &str) {
     );
     let prompt_id = prompt["id"].clone();
 
+    if scenario == "completion_follow_up" {
+        let mut current_prompt = prompt;
+        for turn in 0..16 {
+            let request_id = json!(format!("form-{turn}"));
+            request_elicitation(&mut out, request_id.clone(), small_schema());
+            let result = read_json(&mut lines);
+            assert_eq!(result["id"], request_id);
+            assert!(matches!(
+                result["result"]["action"].as_str(),
+                Some("cancel" | "decline")
+            ));
+            respond(
+                &mut out,
+                current_prompt["id"].clone(),
+                json!({"stopReason": "end_turn"}),
+            );
+            if turn < 15 {
+                current_prompt = read_json(&mut lines);
+                assert_eq!(current_prompt["method"], "session/prompt");
+                assert_eq!(current_prompt["params"]["sessionId"], "sess-test");
+            }
+        }
+        return;
+    }
+
     match scenario {
+        "other_follow_up" => {
+            for (id, schema, answer) in [
+                (
+                    "choice",
+                    json!({"type":"object","properties":{"answer":{"type":"string","oneOf":[{"const":"blue","title":"Blue"},{"const":"other","title":"Other"}]}},"required":["answer"]}),
+                    "other",
+                ),
+                (
+                    "text",
+                    json!({"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}),
+                    "purple",
+                ),
+            ] {
+                request_elicitation(&mut out, json!(id), schema);
+                let result = read_json(&mut lines);
+                assert_eq!(result["id"], id);
+                assert_eq!(result["result"]["action"], "accept", "{result}");
+                assert_eq!(result["result"]["content"]["answer"], answer);
+            }
+        }
         "accept_collision" => {
             request_elicitation(&mut out, prompt_id.clone(), mixed_schema());
             notify(
