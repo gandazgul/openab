@@ -8,6 +8,7 @@
 //! - I3: Broker structural fidelity — no merging, splitting, reordering, or
 //!   semantic transformation of arrival events.
 
+use crate::acp::elicitation::ElicitationContext;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -136,6 +137,7 @@ pub trait DispatchTarget: Send + Sync + 'static {
 
     /// Ensure the ACP session for `session_key` exists (idempotent).
     /// Returns `true` if a new session was created, `false` if it already existed.
+    /// Presenter capability must remain stable until reset; see SessionPool::get_or_create.
     async fn ensure_session(
         &self,
         session_key: &str,
@@ -154,8 +156,7 @@ pub trait DispatchTarget: Send + Sync + 'static {
         session_key: &str,
         content_blocks: Vec<ContentBlock>,
         thread_channel: &ChannelRef,
-        trigger_msg: MessageRef,
-        authorized_user_ids: HashSet<String>,
+        elicitation_context: Option<ElicitationContext>,
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
         recipient: Option<(String, String)>,
@@ -197,8 +198,7 @@ impl DispatchTarget for AdapterRouter {
         session_key: &str,
         content_blocks: Vec<ContentBlock>,
         thread_channel: &ChannelRef,
-        trigger_msg: MessageRef,
-        authorized_user_ids: HashSet<String>,
+        elicitation_context: Option<ElicitationContext>,
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
         recipient: Option<(String, String)>,
@@ -209,8 +209,7 @@ impl DispatchTarget for AdapterRouter {
             session_key,
             content_blocks,
             thread_channel,
-            trigger_msg,
-            authorized_user_ids,
+            elicitation_context,
             reactions,
             other_bot_present,
             recipient,
@@ -805,8 +804,11 @@ async fn dispatch_batch(
             &session_key,
             content_blocks,
             &dispatch_channel,
-            trigger_msg,
-            authorized_user_ids,
+            (!authorized_user_ids.is_empty()).then(|| ElicitationContext {
+                channel: dispatch_channel.clone(),
+                trigger_message: trigger_msg,
+                authorized_user_ids,
+            }),
             reactions.clone(),
             other_bot_present,
             recipient,
@@ -1465,8 +1467,7 @@ mod tests {
             _session_key: &str,
             content_blocks: Vec<ContentBlock>,
             thread_channel: &ChannelRef,
-            _trigger_msg: MessageRef,
-            authorized_user_ids: HashSet<String>,
+            elicitation_context: Option<ElicitationContext>,
             _reactions: Arc<StatusReactionController>,
             other_bot_present: bool,
             _recipient: Option<(String, String)>,
@@ -1475,7 +1476,9 @@ mod tests {
                 block_count: content_blocks.len(),
                 other_bot_present,
                 dispatch_channel: thread_channel.clone(),
-                authorized_user_ids,
+                authorized_user_ids: elicitation_context
+                    .map(|context| context.authorized_user_ids)
+                    .unwrap_or_default(),
             });
             if let Some(msg) = self.stream_err.lock().unwrap().take() {
                 return Err(anyhow::anyhow!(msg));

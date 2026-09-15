@@ -640,8 +640,7 @@ async fn ambient_consumer_loop(
                 &session_key,
                 content_blocks,
                 &channel_ref,
-                dummy_msg_ref,
-                HashSet::new(),
+                None, // no elicitation authority for ambient turns
                 reactions,
                 false, // other_bot_present
                 None,  // no streaming recipient

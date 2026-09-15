@@ -45,6 +45,10 @@ const PARTICIPATION_CACHE_MAX: usize = 1000;
 
 /// Discord StringSelectMenu hard limit on options.
 const SELECT_MENU_PAGE_SIZE: usize = 25;
+const PAGE_BUDGET: usize = 1700;
+const FORM_MESSAGE_MARKER: &str = "-# OpenAB form reply only";
+const COMPLETED_FORM_CAPACITY: usize = 4096;
+const COMPLETED_FORM_TTL: std::time::Duration = std::time::Duration::from_secs(86400);
 
 /// Discord caps select menu option labels and descriptions at 100
 /// characters; anything longer makes the entire interaction response fail
@@ -88,11 +92,98 @@ struct DiscordElicitationState {
     outcome_tx: Option<oneshot::Sender<ElicitationOutcome>>,
 }
 
+/// Bounded recency cache. Persistent message markers protect replies after eviction/restart.
+#[derive(Debug, Default)]
+struct CompletedFormMessages {
+    entries: HashMap<String, tokio::time::Instant>,
+}
+
+impl CompletedFormMessages {
+    fn prune(&mut self, now: tokio::time::Instant) {
+        self.entries
+            .retain(|_, seen| now.duration_since(*seen) < COMPLETED_FORM_TTL);
+    }
+
+    fn insert(&mut self, id: String) {
+        let now = tokio::time::Instant::now();
+        self.prune(now);
+        if self.entries.len() >= COMPLETED_FORM_CAPACITY && !self.entries.contains_key(&id) {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, seen)| **seen)
+                .map(|(id, _)| id.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(id, now);
+    }
+
+    fn contains(&mut self, id: &str) -> bool {
+        let now = tokio::time::Instant::now();
+        self.prune(now);
+        if let Some(seen) = self.entries.get_mut(id) {
+            *seen = now;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn state_is_answerable(
+    state: &DiscordElicitationState,
+    user: &str,
+    channel: &str,
+    message: Option<&str>,
+) -> bool {
+    state.outcome_tx.is_some()
+        && message == Some(state.message_id.as_str())
+        && state.presentation.channel.channel_id == channel
+        && state.presentation.authorized_user_ids.contains(user)
+}
+
+async fn form_reply_notice(http: &Http, channel: ChannelId) -> bool {
+    // Never quote the answer or let it reach normal agent dispatch, even if this send fails.
+    let _ = channel.send_message(http, CreateMessage::new()
+        .content("This form is no longer active, or you cannot answer it. Your reply was not sent to the agent.")
+        .allowed_mentions(no_mentions())).await;
+    true
+}
+
+fn is_form_message(message: &Message) -> bool {
+    if !message.author.bot {
+        return false;
+    }
+    if message.content.contains(FORM_MESSAGE_MARKER)
+        // Recognize terminal messages from deployments before persistent markers.
+        || message.content.contains("Values are not shown after terminal resolution.")
+        || message.content == "This form expired before it was ready."
+    {
+        return true;
+    }
+    message.components.iter().any(|row| {
+        row.components.iter().any(|component| match component {
+            ActionRowComponent::Button(button) => matches!(
+                &button.data,
+                serenity::model::application::ButtonKind::NonLink { custom_id, .. }
+                    if custom_id.starts_with("acp_elicit:")
+            ),
+            ActionRowComponent::SelectMenu(menu) => menu
+                .custom_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("acp_elicit:")),
+            _ => false,
+        })
+    })
+}
+
 #[derive(Debug)]
 pub struct DiscordElicitationRegistry {
     http: Arc<Http>,
     states: TokioMutex<HashMap<String, DiscordElicitationState>>,
-    completed_messages: TokioMutex<HashSet<String>>,
+    completed_messages: TokioMutex<CompletedFormMessages>,
 }
 
 impl DiscordElicitationRegistry {
@@ -100,7 +191,7 @@ impl DiscordElicitationRegistry {
         Arc::new(Self {
             http,
             states: TokioMutex::new(HashMap::new()),
-            completed_messages: TokioMutex::new(HashSet::new()),
+            completed_messages: TokioMutex::new(CompletedFormMessages::default()),
         })
     }
 
@@ -130,13 +221,14 @@ impl DiscordElicitationRegistry {
         author_id: UserId,
         reply_to: Option<MessageId>,
         content: &str,
+        referenced_message: Option<&Message>,
     ) -> bool {
         let reply_to = match reply_to {
             Some(id) => id.to_string(),
             None => return false,
         };
         if self.completed_messages.lock().await.contains(&reply_to) {
-            return true;
+            return form_reply_notice(http, channel_id).await;
         }
 
         let mut states = self.states.lock().await;
@@ -144,15 +236,36 @@ impl DiscordElicitationRegistry {
             state.message_id == reply_to
                 && state.presentation.channel.channel_id == channel_id.to_string()
         }) else {
-            return false;
+            drop(states);
+            // Cache eviction must not turn old form answers into ordinary prompts.
+            // Discord may omit the referenced message; fetch it or fail closed.
+            let fetched;
+            let target = match referenced_message {
+                Some(message) => message,
+                None => {
+                    fetched = channel_id
+                        .message(http, reply_to.parse::<u64>().expect("Discord message ID"))
+                        .await;
+                    match &fetched {
+                        Ok(message) => message,
+                        Err(_) => return form_reply_notice(http, channel_id).await,
+                    }
+                }
+            };
+            return if is_form_message(target) {
+                form_reply_notice(http, channel_id).await
+            } else {
+                false
+            };
         };
-        if state.outcome_tx.is_none()
-            || !state
-                .presentation
-                .authorized_user_ids
-                .contains(&author_id.to_string())
-        {
-            return true;
+        if !state_is_answerable(
+            state,
+            &author_id.to_string(),
+            &channel_id.to_string(),
+            Some(&reply_to),
+        ) {
+            drop(states);
+            return form_reply_notice(http, channel_id).await;
         }
 
         let nonce = nonce.clone();
@@ -162,25 +275,26 @@ impl DiscordElicitationRegistry {
         let generation = state.presentation.generation;
         let message_id: u64 = match state.message_id.parse() {
             Ok(id) => id,
-            Err(_) => return true,
+            Err(_) => {
+                drop(states);
+                return form_reply_notice(http, channel_id).await;
+            }
         };
         drop(states);
         if !coordinator
             .is_authorized_pending(generation, &nonce, &author, &channel)
             .await
         {
-            return true;
+            return form_reply_notice(http, channel_id).await;
         }
         let mut states = self.states.lock().await;
         let Some(state) = states.get_mut(&nonce) else {
-            return true;
+            drop(states);
+            return form_reply_notice(http, channel_id).await;
         };
-        if state.outcome_tx.is_none()
-            || state.message_id != reply_to
-            || state.presentation.channel.channel_id != channel_id.to_string()
-            || !state.presentation.authorized_user_ids.contains(&author)
-        {
-            return true;
+        if !state_is_answerable(state, &author, &channel_id.to_string(), Some(&reply_to)) {
+            drop(states);
+            return form_reply_notice(http, channel_id).await;
         }
         let terminal = apply_text_reply(state, content);
         let page = render_elicitation_content(state, None);
@@ -189,9 +303,12 @@ impl DiscordElicitationRegistry {
 
         match terminal {
             Some(outcome) => {
-                let _ = self
+                if !self
                     .complete(&nonce, &author, &channel, Some(&reply_to), outcome)
-                    .await;
+                    .await
+                {
+                    return form_reply_notice(http, channel_id).await;
+                }
             }
             None => {
                 if ChannelId::new(channel_id.get())
@@ -364,7 +481,9 @@ impl FormPresenter for DiscordElicitationRegistry {
                     &self.http,
                     msg.id,
                     EditMessage::new()
-                        .content("This form expired before it was ready.")
+                        .content(format!(
+                            "This form expired before it was ready.\n{FORM_MESSAGE_MARKER}"
+                        ))
                         .allowed_mentions(no_mentions())
                         .suppress_embeds(true)
                         .components(vec![]),
@@ -412,7 +531,10 @@ impl FormPresenter for DiscordElicitationRegistry {
                 &self.http,
                 MessageId::new(message_id),
                 EditMessage::new()
-                    .content(truncate_for_discord(&content, 1900))
+                    .content(format!(
+                        "{}\n{FORM_MESSAGE_MARKER}",
+                        truncate_for_discord(&content, 1800)
+                    ))
                     .allowed_mentions(no_mentions())
                     .suppress_embeds(true)
                     .components(vec![]),
@@ -429,7 +551,6 @@ fn render_resolved_summary(state: &DiscordElicitationState) -> String {
 }
 
 fn page_text(full: &str, page: usize) -> String {
-    const PAGE_BUDGET: usize = 1700;
     let chunks = split_display_pages(full, PAGE_BUDGET);
     let total = chunks.len().max(1);
     let page = page.min(total - 1);
@@ -570,7 +691,10 @@ fn current_full_elicitation_content(
 
 fn render_elicitation_content(state: &DiscordElicitationState, error: Option<&str>) -> String {
     let full = current_full_elicitation_content(state, error);
-    page_text(&full, state.display_page)
+    format!(
+        "{}\n{FORM_MESSAGE_MARKER}",
+        page_text(&full, state.display_page)
+    )
 }
 
 fn render_elicitation_components(
@@ -579,7 +703,7 @@ fn render_elicitation_components(
 ) -> Vec<CreateActionRow> {
     let nonce = &state.presentation.nonce;
     let full = current_full_elicitation_content(state, None);
-    let total_pages = split_display_pages(&full, 1700).len();
+    let total_pages = split_display_pages(&full, PAGE_BUDGET).len();
     let mut rows = Vec::new();
     if total_pages > 1 {
         rows.push(CreateActionRow::Buttons(vec![
@@ -595,7 +719,7 @@ fn render_elicitation_components(
     }
     if state.current_field >= state.presentation.form.fields.len() {
         rows.push(CreateActionRow::Buttons(vec![
-            CreateButton::new(format!("acp_elicit:{nonce}:modify:0"))
+            CreateButton::new(format!("acp_elicit:{nonce}:modify"))
                 .label("Modify")
                 .style(ButtonStyle::Secondary)
                 .disabled(disabled || state.presentation.form.fields.is_empty()),
@@ -643,14 +767,18 @@ fn render_elicitation_components(
                     .map(|choice| {
                         let mut option = CreateSelectMenuOption::new(
                             truncate_for_discord(
-                                choice.label.as_deref().unwrap_or(&choice.value),
+                                &neutralize_agent_text(
+                                    choice.label.as_deref().unwrap_or(&choice.value),
+                                ),
                                 SELECT_OPTION_TEXT_MAX,
                             ),
                             &choice.value,
                         );
                         if let Some(desc) = &choice.description {
-                            option = option
-                                .description(truncate_for_discord(desc, SELECT_OPTION_TEXT_MAX));
+                            option = option.description(truncate_for_discord(
+                                &neutralize_agent_text(desc),
+                                SELECT_OPTION_TEXT_MAX,
+                            ));
                         }
                         option
                     })
@@ -669,7 +797,9 @@ fn render_elicitation_components(
                     .map(|choice| {
                         CreateSelectMenuOption::new(
                             truncate_for_discord(
-                                choice.label.as_deref().unwrap_or(&choice.value),
+                                &neutralize_agent_text(
+                                    choice.label.as_deref().unwrap_or(&choice.value),
+                                ),
                                 SELECT_OPTION_TEXT_MAX,
                             ),
                             &choice.value,
@@ -725,6 +855,69 @@ fn render_elicitation_components(
     rows
 }
 
+fn elicitation_modal(
+    state: &DiscordElicitationState,
+    index: usize,
+) -> Result<CreateModal, &'static str> {
+    let field = state
+        .presentation
+        .form
+        .fields
+        .get(index)
+        .ok_or("This form field is no longer active.")?;
+    let label = truncate_for_discord(&neutralize_agent_text(field.display_name()), 45);
+    let mut input = CreateInputText::new(InputTextStyle::Paragraph, label.clone(), "value")
+        .required(field.required);
+    if let Some(value) = state.values.get(&field.name).or(field.default.as_ref()) {
+        // Editable data is not presentation text: never sanitize or truncate it.
+        let default = display_value(value);
+        if default.encode_utf16().count() > 4000 {
+            return Err("This value is too long for a modal. Reply to the form with text instead.");
+        }
+        input = input.value(default);
+    }
+    Ok(CreateModal::new(
+        format!(
+            "acp_elicit:{}:modal_value:{index}",
+            state.presentation.nonce
+        ),
+        label,
+    )
+    .components(vec![CreateActionRow::InputText(input)]))
+}
+
+fn elicitation_update(
+    state: &DiscordElicitationState,
+    error: Option<&str>,
+) -> CreateInteractionResponse {
+    CreateInteractionResponse::UpdateMessage(
+        CreateInteractionResponseMessage::new()
+            .content(render_elicitation_content(state, error))
+            .allowed_mentions(no_mentions())
+            .components(render_elicitation_components(state, false)),
+    )
+}
+
+/// Terminal actions are separate from navigation and field edits.
+fn elicitation_terminal(
+    state: &DiscordElicitationState,
+    action: &str,
+) -> Result<Option<ElicitationOutcome>, String> {
+    match action {
+        "submit" => {
+            state
+                .presentation
+                .form
+                .validate_content(&state.values)
+                .map_err(|err| err.message)?;
+            Ok(Some(ElicitationOutcome::Accept(state.values.clone())))
+        }
+        "decline" => Ok(Some(ElicitationOutcome::Decline)),
+        "cancel" => Ok(Some(ElicitationOutcome::Cancel)),
+        _ => Ok(None),
+    }
+}
+
 fn apply_text_reply(
     state: &mut DiscordElicitationState,
     content: &str,
@@ -732,10 +925,15 @@ fn apply_text_reply(
     let trimmed = content.trim();
     state.validation_error = None;
     if let Some(command) = trimmed.strip_prefix("!form") {
+        if !command.is_empty() && !command.starts_with(char::is_whitespace) {
+            state.validation_error =
+                Some("Use a space after `!form`, for example `!form next`.".into());
+            return None;
+        }
         let command = command.trim_start();
         if command.eq_ignore_ascii_case("next") {
             let full = current_full_elicitation_content(state, None);
-            let pages = split_display_pages(&full, 1700).len();
+            let pages = split_display_pages(&full, PAGE_BUDGET).len();
             state.display_page = (state.display_page + 1).min(pages.saturating_sub(1));
             return None;
         }
@@ -859,7 +1057,9 @@ fn apply_current_field_text(
     };
     let parsed = if json_value {
         serde_json::from_str::<Value>(raw)
-            .map_err(|e| crate::acp::elicitation::ElicitationError::invalid_params(e.to_string()))
+            .map_err(|_| crate::acp::elicitation::ElicitationError::invalid_params(
+                "Enter a valid JSON value, for example `!form value \"hello\"`, `!form value 42`, or `!form value [\"a\", \"b\"]`."
+            ))
     } else {
         field.parse_user_text(raw)
     };
@@ -901,6 +1101,13 @@ fn neutralize_agent_text(text: &str) -> String {
         .chars()
         .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
         .collect();
+    static DOMAIN_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?i)[\p{L}\p{N}](?:[\p{L}\p{N}-]*[\p{L}\p{N}])?(?:\.[\p{L}\p{N}](?:[\p{L}\p{N}-]*[\p{L}\p{N}])?)+")
+            .expect("valid domain neutralizer")
+    });
+    let cleaned = DOMAIN_RE.replace_all(&cleaned, |caps: &regex::Captures<'_>| {
+        caps[0].replace('.', "[.]")
+    });
     let escaped: String = cleaned
         .chars()
         .flat_map(|c| match c {
@@ -990,19 +1197,29 @@ fn field_text_instructions(field: &FormField) -> String {
     }
 }
 
-fn parse_elicitation_custom_id(
-    custom_id: &str,
-) -> Option<(&str, &str, Option<&str>, Option<&str>)> {
-    let parts: Vec<&str> = custom_id.split(':').collect();
-    if parts.first() != Some(&"acp_elicit") || parts.len() < 3 {
+#[derive(Debug, PartialEq, Eq)]
+struct ElicitationCustomId<'a> {
+    nonce: &'a str,
+    action: &'a str,
+    field_ref: Option<&'a str>,
+    value_part: Option<&'a str>,
+}
+
+fn parse_elicitation_custom_id(custom_id: &str) -> Option<ElicitationCustomId<'_>> {
+    let mut parts = custom_id.split(':');
+    if parts.next()? != "acp_elicit" {
         return None;
     }
-    Some((
-        parts[1],
-        parts[2],
-        parts.get(3).copied(),
-        parts.get(4).copied(),
-    ))
+    let parsed = ElicitationCustomId {
+        nonce: parts.next()?,
+        action: parts.next()?,
+        field_ref: parts.next(),
+        value_part: parts.next(),
+    };
+    if parsed.nonce.is_empty() || parsed.action.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some(parsed)
 }
 
 fn modal_value(modal: &serenity::model::application::ModalInteraction) -> Option<String> {
@@ -1223,7 +1440,8 @@ pub struct Handler {
     pub allowed_users: HashSet<u64>,
     pub stt_config: SttConfig,
     pub adapter: OnceLock<Arc<dyn ChatAdapter>>,
-    pub elicitation: Arc<DiscordElicitationRegistry>,
+    /// Initialized from the built Client's Http before Client::start dispatches events.
+    pub elicitation: OnceLock<Arc<DiscordElicitationRegistry>>,
     /// Optional filestore for uploading file attachments.
     #[cfg(feature = "filestore")]
     pub filestore: Option<Arc<crate::filestore::Filestore>>,
@@ -1461,12 +1679,15 @@ impl EventHandler for Handler {
         if !msg.author.bot
             && self
                 .elicitation
+                .get()
+                .expect("Discord presenter initialized before start")
                 .handle_text_reply(
                     &ctx.http,
                     msg.channel_id,
                     msg.author.id,
                     msg.message_reference.as_ref().and_then(|r| r.message_id),
                     &msg.content,
+                    msg.referenced_message.as_deref(),
                 )
                 .await
         {
@@ -1478,7 +1699,10 @@ impl EventHandler for Handler {
             .get_or_init(|| {
                 Arc::new(DiscordAdapter::from_parts(
                     ctx.http.clone(),
-                    self.elicitation.clone(),
+                    self.elicitation
+                        .get()
+                        .expect("Discord presenter initialized before start")
+                        .clone(),
                 ))
             })
             .clone();
@@ -2216,7 +2440,10 @@ impl EventHandler for Handler {
             .get_or_init(|| {
                 Arc::new(DiscordAdapter::from_parts(
                     ctx.http.clone(),
-                    self.elicitation.clone(),
+                    self.elicitation
+                        .get()
+                        .expect("Discord presenter initialized before start")
+                        .clone(),
                 ))
             })
             .clone();
@@ -3473,26 +3700,32 @@ impl Handler {
         ctx: &Context,
         comp: &serenity::model::application::ComponentInteraction,
     ) {
-        let Some((nonce, action, field_ref, value_part)) =
-            parse_elicitation_custom_id(&comp.data.custom_id)
+        let Some(ElicitationCustomId {
+            nonce,
+            action,
+            field_ref,
+            value_part,
+        }) = parse_elicitation_custom_id(&comp.data.custom_id)
         else {
             return;
         };
-        let registry = self.elicitation.clone();
+        let registry = self
+            .elicitation
+            .get()
+            .expect("Discord presenter initialized before start")
+            .clone();
         let mut states = registry.states.lock().await;
         let Some(state) = states.get_mut(nonce) else {
             drop(states);
             respond_ephemeral(ctx, comp, "This form is no longer active.").await;
             return;
         };
-        if state.outcome_tx.is_none()
-            || state.message_id != comp.message.id.to_string()
-            || state.presentation.channel.channel_id != comp.channel_id.to_string()
-            || !state
-                .presentation
-                .authorized_user_ids
-                .contains(&comp.user.id.to_string())
-        {
+        if !state_is_answerable(
+            state,
+            &comp.user.id.to_string(),
+            &comp.channel_id.to_string(),
+            Some(&comp.message.id.to_string()),
+        ) {
             drop(states);
             respond_ephemeral(ctx, comp, "You cannot answer this form.").await;
             return;
@@ -3514,11 +3747,12 @@ impl Handler {
             respond_ephemeral(ctx, comp, "This form is no longer active.").await;
             return;
         };
-        if state.outcome_tx.is_none()
-            || state.message_id != comp.message.id.to_string()
-            || state.presentation.channel.channel_id != comp.channel_id.to_string()
-            || !state.presentation.authorized_user_ids.contains(&user_id)
-        {
+        if !state_is_answerable(
+            state,
+            &comp.user.id.to_string(),
+            &comp.channel_id.to_string(),
+            Some(&comp.message.id.to_string()),
+        ) {
             drop(states);
             respond_ephemeral(ctx, comp, "This form is no longer active.").await;
             return;
@@ -3533,23 +3767,14 @@ impl Handler {
                 respond_ephemeral(ctx, comp, "This form field is no longer active.").await;
                 return;
             }
-            let Some(field) = state.presentation.form.fields.get(index) else {
-                return;
+            let modal = match elicitation_modal(state, index) {
+                Ok(modal) => modal,
+                Err(message) => {
+                    drop(states);
+                    respond_ephemeral(ctx, comp, message).await;
+                    return;
+                }
             };
-            let mut input = CreateInputText::new(
-                InputTextStyle::Paragraph,
-                truncate_for_discord(field.display_name(), 45),
-                "value",
-            )
-            .required(field.required);
-            if let Some(value) = state.values.get(&field.name).or(field.default.as_ref()) {
-                input = input.value(truncate_for_discord(&display_value(value), 4000));
-            }
-            let modal = CreateModal::new(
-                format!("acp_elicit:{nonce}:modal_value:{index}"),
-                truncate_for_discord(field.display_name(), 45),
-            )
-            .components(vec![CreateActionRow::InputText(input)]);
             let message_id = state.message_id.parse::<u64>().ok();
             let channel_id = comp.channel_id;
             drop(states);
@@ -3586,26 +3811,37 @@ impl Handler {
             return;
         }
 
+        match elicitation_terminal(state, action) {
+            Ok(Some(outcome)) => {
+                let message_id = comp.message.id.to_string();
+                drop(states);
+                registry
+                    .complete(nonce, &user_id, &channel, Some(&message_id), outcome)
+                    .await;
+                let _ = comp
+                    .create_response(&ctx.http, CreateInteractionResponse::Acknowledge)
+                    .await;
+                return;
+            }
+            Err(error) => {
+                let response = elicitation_update(state, Some(&error));
+                drop(states);
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            }
+            Ok(None) => {}
+        }
+
         let response = match action {
             "next" => {
                 let full = current_full_elicitation_content(state, None);
-                let pages = split_display_pages(&full, 1700).len();
+                let pages = split_display_pages(&full, PAGE_BUDGET).len();
                 state.display_page = (state.display_page + 1).min(pages.saturating_sub(1));
-                CreateInteractionResponse::UpdateMessage(
-                    CreateInteractionResponseMessage::new()
-                        .content(render_elicitation_content(state, None))
-                        .allowed_mentions(no_mentions())
-                        .components(render_elicitation_components(state, false)),
-                )
+                elicitation_update(state, None)
             }
             "prev" => {
                 state.display_page = state.display_page.saturating_sub(1);
-                CreateInteractionResponse::UpdateMessage(
-                    CreateInteractionResponseMessage::new()
-                        .content(render_elicitation_content(state, None))
-                        .allowed_mentions(no_mentions())
-                        .components(render_elicitation_components(state, false)),
-                )
+                elicitation_update(state, None)
             }
             "bool" => {
                 if let (Some(index), Some(value_part)) =
@@ -3615,15 +3851,7 @@ impl Handler {
                         if let Some(field) = state.presentation.form.fields.get(index) {
                             let value = Value::Bool(value_part == "true");
                             if let Err(err) = field.validate_value(&value) {
-                                let response = CreateInteractionResponse::UpdateMessage(
-                                    CreateInteractionResponseMessage::new()
-                                        .content(render_elicitation_content(
-                                            state,
-                                            Some(&err.message),
-                                        ))
-                                        .allowed_mentions(no_mentions())
-                                        .components(render_elicitation_components(state, false)),
-                                );
+                                let response = elicitation_update(state, Some(&err.message));
                                 drop(states);
                                 let _ = comp.create_response(&ctx.http, response).await;
                                 return;
@@ -3635,12 +3863,7 @@ impl Handler {
                         }
                     }
                 }
-                CreateInteractionResponse::UpdateMessage(
-                    CreateInteractionResponseMessage::new()
-                        .content(render_elicitation_content(state, None))
-                        .allowed_mentions(no_mentions())
-                        .components(render_elicitation_components(state, false)),
-                )
+                elicitation_update(state, None)
             }
             "select" | "multi" => {
                 if let Some(index) = field_ref.and_then(|s| s.parse::<usize>().ok()) {
@@ -3662,15 +3885,7 @@ impl Handler {
                                 _ => Value::Null,
                             };
                             if let Err(err) = field.validate_value(&value) {
-                                let response = CreateInteractionResponse::UpdateMessage(
-                                    CreateInteractionResponseMessage::new()
-                                        .content(render_elicitation_content(
-                                            state,
-                                            Some(&err.message),
-                                        ))
-                                        .allowed_mentions(no_mentions())
-                                        .components(render_elicitation_components(state, false)),
-                                );
+                                let response = elicitation_update(state, Some(&err.message));
                                 drop(states);
                                 let _ = comp.create_response(&ctx.http, response).await;
                                 return;
@@ -3682,12 +3897,7 @@ impl Handler {
                         }
                     }
                 }
-                CreateInteractionResponse::UpdateMessage(
-                    CreateInteractionResponseMessage::new()
-                        .content(render_elicitation_content(state, None))
-                        .allowed_mentions(no_mentions())
-                        .components(render_elicitation_components(state, false)),
-                )
+                elicitation_update(state, None)
             }
             "skip" => {
                 if let Some(index) = field_ref.and_then(|s| s.parse::<usize>().ok()) {
@@ -3697,75 +3907,11 @@ impl Handler {
                         state.display_page = 0;
                     }
                 }
-                CreateInteractionResponse::UpdateMessage(
-                    CreateInteractionResponseMessage::new()
-                        .content(render_elicitation_content(state, None))
-                        .allowed_mentions(no_mentions())
-                        .components(render_elicitation_components(state, false)),
-                )
+                elicitation_update(state, None)
             }
             "modify" => {
-                if let Some(index) = field_ref.and_then(|s| s.parse::<usize>().ok()) {
-                    state.current_field = index.min(state.presentation.form.fields.len());
-                    state.display_page = 0;
-                }
-                CreateInteractionResponse::UpdateMessage(
-                    CreateInteractionResponseMessage::new()
-                        .content(render_elicitation_content(state, None))
-                        .allowed_mentions(no_mentions())
-                        .components(render_elicitation_components(state, false)),
-                )
-            }
-            "submit" => {
-                if let Err(err) = state.presentation.form.validate_content(&state.values) {
-                    CreateInteractionResponse::UpdateMessage(
-                        CreateInteractionResponseMessage::new()
-                            .content(render_elicitation_content(state, Some(&err.message)))
-                            .allowed_mentions(no_mentions())
-                            .components(render_elicitation_components(state, false)),
-                    )
-                } else {
-                    let values = state.values.clone();
-                    let user_id = comp.user.id.to_string();
-                    let channel = state.presentation.channel.clone();
-                    drop(states);
-                    registry
-                        .complete(
-                            nonce,
-                            &user_id,
-                            &channel,
-                            None,
-                            ElicitationOutcome::Accept(values),
-                        )
-                        .await;
-                    let _ = comp
-                        .create_response(&ctx.http, CreateInteractionResponse::Acknowledge)
-                        .await;
-                    return;
-                }
-            }
-            "decline" => {
-                let user_id = comp.user.id.to_string();
-                let channel = state.presentation.channel.clone();
                 drop(states);
-                registry
-                    .complete(nonce, &user_id, &channel, None, ElicitationOutcome::Decline)
-                    .await;
-                let _ = comp
-                    .create_response(&ctx.http, CreateInteractionResponse::Acknowledge)
-                    .await;
-                return;
-            }
-            "cancel" => {
-                let user_id = comp.user.id.to_string();
-                let channel = state.presentation.channel.clone();
-                drop(states);
-                registry
-                    .complete(nonce, &user_id, &channel, None, ElicitationOutcome::Cancel)
-                    .await;
-                let _ = comp
-                    .create_response(&ctx.http, CreateInteractionResponse::Acknowledge)
-                    .await;
+                respond_ephemeral(ctx, comp, "Reply to the form message with `!form edit N`, using the field number shown in the review (for example `!form edit 2`).").await;
                 return;
             }
             _ => return,
@@ -3807,8 +3953,12 @@ impl Handler {
         ctx: &Context,
         modal: &serenity::model::application::ModalInteraction,
     ) {
-        let Some((nonce, action, field_ref, _)) =
-            parse_elicitation_custom_id(&modal.data.custom_id)
+        let Some(ElicitationCustomId {
+            nonce,
+            action,
+            field_ref,
+            ..
+        }) = parse_elicitation_custom_id(&modal.data.custom_id)
         else {
             return;
         };
@@ -3818,7 +3968,11 @@ impl Handler {
         let Some(index) = field_ref.and_then(|s| s.parse::<usize>().ok()) else {
             return;
         };
-        let registry = self.elicitation.clone();
+        let registry = self
+            .elicitation
+            .get()
+            .expect("Discord presenter initialized before start")
+            .clone();
         let mut states = registry.states.lock().await;
         let Some(state) = states.get_mut(nonce) else {
             drop(states);
@@ -3835,14 +3989,12 @@ impl Handler {
             return;
         };
         let modal_message_id = modal.message.as_ref().map(|message| message.id.to_string());
-        if state.outcome_tx.is_none()
-            || modal_message_id.as_deref() != Some(state.message_id.as_str())
-            || state.presentation.channel.channel_id != modal.channel_id.to_string()
-            || !state
-                .presentation
-                .authorized_user_ids
-                .contains(&modal.user.id.to_string())
-        {
+        if !state_is_answerable(
+            state,
+            &modal.user.id.to_string(),
+            &modal.channel_id.to_string(),
+            modal_message_id.as_deref(),
+        ) {
             drop(states);
             let _ = modal
                 .create_response(
@@ -3881,11 +4033,12 @@ impl Handler {
         let Some(state) = states.get_mut(nonce) else {
             return;
         };
-        if state.outcome_tx.is_none()
-            || modal_message_id.as_deref() != Some(state.message_id.as_str())
-            || state.presentation.channel.channel_id != modal.channel_id.to_string()
-            || !state.presentation.authorized_user_ids.contains(&user_id)
-        {
+        if !state_is_answerable(
+            state,
+            &modal.user.id.to_string(),
+            &modal.channel_id.to_string(),
+            modal_message_id.as_deref(),
+        ) {
             return;
         }
         if index != state.current_field {
@@ -4841,7 +4994,7 @@ mod tests {
         let state = test_elicitation_state(2);
         let content = render_elicitation_content(&state, None);
         assert!(content.contains("agent ＠everyone"));
-        assert!(content.contains("https[:]//example.com"));
+        assert!(content.contains("https[:]//example\\[.\\]com"));
         assert!(!content.contains("@everyone"));
         assert!(!content.contains("https://example.com"));
     }
@@ -4883,7 +5036,7 @@ mod tests {
         assert!(full.contains("100. choice-99 = `choice-99`"));
         assert!(!full.contains("…"));
 
-        let pages = split_display_pages(&full, 1700);
+        let pages = split_display_pages(&full, PAGE_BUDGET);
         assert!(pages.len() > 1);
         for (i, _) in pages.iter().enumerate() {
             state.display_page = i;
@@ -4914,6 +5067,260 @@ mod tests {
             panic!("submit should accept valid values");
         };
         assert_eq!(values.get("choice"), Some(&serde_json::json!("choice-98")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn elicitation_completed_cache_bounds_churn_and_expires_idle_entries() {
+        let mut cache = CompletedFormMessages::default();
+        for i in 0..COMPLETED_FORM_CAPACITY * 3 {
+            cache.insert(i.to_string());
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
+            assert!(cache.entries.len() <= COMPLETED_FORM_CAPACITY);
+        }
+        assert!(!cache.contains("0"));
+        let recent = (COMPLETED_FORM_CAPACITY * 3 - 1).to_string();
+        assert!(cache.contains(&recent));
+        tokio::time::advance(COMPLETED_FORM_TTL).await;
+        assert!(!cache.contains(&recent));
+        assert!(cache.entries.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn elicitation_completed_cache_retains_recently_used_entries() {
+        let mut cache = CompletedFormMessages::default();
+        for i in 0..COMPLETED_FORM_CAPACITY {
+            cache.insert(i.to_string());
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(cache.contains("0"));
+        cache.insert("new".into());
+        assert!(cache.contains("0"));
+        assert!(!cache.contains("1"));
+    }
+
+    #[test]
+    fn elicitation_stale_message_marker_survives_without_cache_or_controls() {
+        let state = test_elicitation_state(2);
+        let mut message = Message::default();
+        message.author.bot = true;
+        message.content = render_elicitation_content(&state, None);
+        assert!(is_form_message(&message));
+        message.content = format!("Expired\n{FORM_MESSAGE_MARKER}");
+        assert!(is_form_message(&message));
+        message.content = "**Agent requested information**\n\nValues are not shown after terminal resolution.\n\n**Status:** Submitted".into();
+        assert!(is_form_message(&message));
+        message.content = "An ordinary bot response".into();
+        assert!(!is_form_message(&message));
+    }
+
+    #[test]
+    fn elicitation_answerability_requires_live_authorized_user_channel_and_message() {
+        let mut state = test_elicitation_state(2);
+        let (tx, _rx) = oneshot::channel();
+        state.outcome_tx = Some(tx);
+        assert!(state_is_answerable(&state, "user-a", "10", Some("100")));
+        assert!(!state_is_answerable(&state, "user-b", "10", Some("100")));
+        assert!(!state_is_answerable(&state, "user-a", "11", Some("100")));
+        assert!(!state_is_answerable(&state, "user-a", "10", Some("101")));
+        assert!(!state_is_answerable(&state, "user-a", "10", None));
+        state.outcome_tx.take();
+        assert!(!state_is_answerable(&state, "user-a", "10", Some("100")));
+    }
+
+    #[test]
+    fn elicitation_component_labels_are_safe_but_choice_values_are_exact() {
+        let mut state = test_elicitation_state(2);
+        let raw = "@everyone evil.example";
+        if let FormFieldKind::SingleSelect { choices } = &mut state.presentation.form.fields[0].kind
+        {
+            choices[0].value = raw.into();
+            choices[0].label = Some(raw.into());
+            choices[0].description = Some(raw.into());
+        }
+        let components =
+            serde_json::to_value(render_elicitation_components(&state, false)).unwrap();
+        let option = &components[0]["components"][0]["options"][0];
+        assert_eq!(option["value"], raw);
+        for key in ["label", "description"] {
+            let display = option[key].as_str().unwrap();
+            assert!(!display.contains("@everyone"));
+            assert!(!display.contains("evil.example"));
+        }
+        apply_text_reply(&mut state, "!form choose 1");
+        assert_eq!(state.values["choice"], raw);
+    }
+
+    #[test]
+    fn elicitation_modal_sanitizes_labels_but_preserves_editable_defaults() {
+        let mut state = test_elicitation_state(2);
+        let raw = "@everyone evil.example **text**";
+        state.presentation.form.fields[0].title = Some(raw.into());
+        state.presentation.form.fields[0].default = Some(Value::String(raw.into()));
+        let modal = serde_json::to_value(elicitation_modal(&state, 0).unwrap()).unwrap();
+        let input = &modal["components"][0]["components"][0];
+        assert_eq!(input["value"], raw);
+        for label in [&modal["title"], &input["label"]] {
+            assert!(!label.as_str().unwrap().contains("@everyone"));
+            assert!(!label.as_str().unwrap().contains("evil.example"));
+        }
+        state.presentation.form.fields[0].default = Some(Value::String("x".repeat(4001)));
+        assert!(elicitation_modal(&state, 0).is_err());
+    }
+
+    #[test]
+    fn elicitation_bare_domains_are_defanged_only_for_display() {
+        for domain in [
+            "evil.example",
+            "www.evil.example/path",
+            "EVIL.COM",
+            "例子.测试",
+        ] {
+            let value = Value::String(domain.into());
+            assert!(!neutralize_agent_text(&display_value(&value)).contains(domain));
+            assert_eq!(value.as_str(), Some(domain));
+        }
+    }
+
+    #[test]
+    fn elicitation_text_command_requires_separator() {
+        let mut state = test_elicitation_state(2);
+        apply_text_reply(&mut state, "!formreview");
+        assert_eq!(state.current_field, 0);
+        assert!(state.validation_error.as_deref().unwrap().contains("space"));
+        apply_text_reply(&mut state, "!form\treview");
+        assert_eq!(state.current_field, 2);
+    }
+
+    #[test]
+    fn elicitation_json_error_gives_valid_example_without_parser_details() {
+        let mut state = test_elicitation_state(2);
+        apply_text_reply(&mut state, "!form value not-json");
+        let error = state.validation_error.as_deref().unwrap();
+        assert!(error.contains("!form value \"hello\""));
+        assert!(!error.contains("line 1"));
+        assert!(state.values.is_empty());
+    }
+
+    #[test]
+    fn elicitation_modify_directs_to_numbered_text_edit_without_selecting_field_zero() {
+        let mut state = test_elicitation_state(2);
+        state.current_field = state.presentation.form.fields.len();
+        let components =
+            serde_json::to_value(render_elicitation_components(&state, false)).unwrap();
+        assert_eq!(
+            components[0]["components"][0]["custom_id"],
+            "acp_elicit:nonce:modify"
+        );
+        apply_text_reply(&mut state, "!form edit 2");
+        assert_eq!(state.current_field, 1);
+    }
+
+    #[tokio::test]
+    async fn elicitation_rejected_text_replies_send_notice_and_never_fall_through() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for case in ["unauthorized", "cached", "evicted"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let http = Arc::new(
+                serenity::http::HttpBuilder::new("test-only-token")
+                    .proxy(format!("http://{}", listener.local_addr().unwrap()))
+                    .ratelimiter_disabled(true)
+                    .build(),
+            );
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buf = [0; 4096];
+                    let count = stream.read(&mut buf).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&buf[..count]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .and_then(|value| value.parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                // A failed Discord notice must also keep the answer out of agent dispatch.
+                stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: 33\r\nConnection: close\r\n\r\n{\"message\":\"denied\",\"code\":50013}").await.unwrap();
+                String::from_utf8(request).unwrap()
+            });
+            let registry = DiscordElicitationRegistry::new(http.clone());
+            let mut target = Message::default();
+            target.id = MessageId::new(100);
+            target.author.bot = true;
+            target.content = format!("Expired\n{FORM_MESSAGE_MARKER}");
+            if case == "unauthorized" {
+                let mut state = test_elicitation_state(2);
+                let (tx, _rx) = oneshot::channel();
+                state.outcome_tx = Some(tx);
+                registry.states.lock().await.insert("nonce".into(), state);
+            } else if case == "cached" {
+                registry
+                    .completed_messages
+                    .lock()
+                    .await
+                    .insert("100".into());
+            }
+            let consumed = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                registry.handle_text_reply(
+                    &http,
+                    ChannelId::new(10),
+                    UserId::new(999),
+                    Some(MessageId::new(100)),
+                    "sensitive-answer-never-forward",
+                    Some(&target),
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(consumed, "{case}");
+            let request = server.await.unwrap();
+            assert!(request.starts_with("POST "));
+            assert!(request.contains("Your reply was not sent to the agent"));
+            assert!(!request.contains("sensitive-answer-never-forward"));
+            target.content = "ordinary message".into();
+            if case == "evicted" {
+                assert!(
+                    !registry
+                        .handle_text_reply(
+                            &http,
+                            ChannelId::new(10),
+                            UserId::new(999),
+                            Some(MessageId::new(100)),
+                            "ordinary reply",
+                            Some(&target)
+                        )
+                        .await
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn elicitation_custom_ids_have_named_parts_and_reject_extra_parts() {
+        let id = parse_elicitation_custom_id("acp_elicit:nonce:bool:1:true").unwrap();
+        assert_eq!(id.nonce, "nonce");
+        assert_eq!(id.action, "bool");
+        assert_eq!(id.field_ref, Some("1"));
+        assert_eq!(id.value_part, Some("true"));
+        for invalid in [
+            "acp_elicit::submit",
+            "acp_elicit:n:",
+            "acp_elicit:n:bool:1:true:extra",
+            "other:n:submit",
+        ] {
+            assert!(parse_elicitation_custom_id(invalid).is_none());
+        }
     }
 
     // --- truncate_for_discord (select menu option 100-char cap) ---

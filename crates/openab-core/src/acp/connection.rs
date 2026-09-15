@@ -1,7 +1,8 @@
 use crate::acp::elicitation::{
     jsonrpc_error, jsonrpc_success, presentation_failure, validate_accepted_content,
-    ConnectionGeneration, ElicitationCoordinator, ElicitationOutcome, ElicitationStart,
-    ElicitationStatus, ElicitationTurnContext, FormPresenter, MAX_ACP_FRAME_BYTES,
+    ConnectionGeneration, ElicitationContext, ElicitationCoordinator, ElicitationOutcome,
+    ElicitationStart, ElicitationStatus, ElicitationTurnContext, FormPresenter,
+    MAX_ACP_FRAME_BYTES,
 };
 use crate::acp::protocol::{
     parse_config_options, parse_usage_report, ConfigOption, JsonRpcId, JsonRpcMessage,
@@ -9,10 +10,10 @@ use crate::acp::protocol::{
 };
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
@@ -272,21 +273,25 @@ where
         line.clear();
         let mut close_reader = false;
         loop {
-            let mut byte = [0u8; 1];
-            match reader.read(&mut byte).await {
-                Ok(0) if line.is_empty() => break,
-                Ok(0) => break,
-                Ok(_) => {
-                    if line.len() >= MAX_ACP_FRAME_BYTES {
+            match reader.fill_buf().await {
+                Ok([]) => break,
+                Ok(chunk) => {
+                    let newline = chunk.iter().position(|byte| *byte == b'\n');
+                    let consumed = newline.map_or(chunk.len(), |index| index + 1);
+                    if consumed > MAX_ACP_FRAME_BYTES - line.len() {
                         error!(
                             limit = MAX_ACP_FRAME_BYTES,
                             "ACP frame exceeded maximum size"
                         );
+                        // This stdout pipe belongs to one child and is never reused.
+                        // Drop it without draining: an untrusted child could otherwise
+                        // keep cleanup blocked forever by sending an endless frame.
                         close_reader = true;
                         break;
                     }
-                    line.push(byte[0]);
-                    if byte[0] == b'\n' {
+                    line.extend_from_slice(&chunk[..consumed]);
+                    reader.consume(consumed);
+                    if newline.is_some() {
                         break;
                     }
                 }
@@ -424,7 +429,7 @@ where
                                     }
                                 }
                             };
-                            let status = match &outcome {
+                            let mut status = match &outcome {
                                 Ok(ElicitationOutcome::Accept(_)) => ElicitationStatus::Submitted,
                                 Ok(ElicitationOutcome::Decline) => ElicitationStatus::Declined,
                                 Ok(ElicitationOutcome::Cancel) => ElicitationStatus::Cancelled,
@@ -440,6 +445,7 @@ where
                                 false
                             };
                             if !delivered {
+                                status = ElicitationStatus::Expired;
                                 warn!("failed to write elicitation response; expiring generation");
                                 elicitation
                                     .expire_generation_nonce(
@@ -963,12 +969,12 @@ impl AcpConnection {
         (self.elicitation.clone(), self.generation)
     }
 
+    /// Start a turn. `None` supplies no human elicitation authority.
+    /// Request and generation authority always come from this connection.
     pub async fn session_prompt(
         &mut self,
         content_blocks: Vec<ContentBlock>,
-        turn_channel: crate::adapter::ChannelRef,
-        trigger_message: crate::adapter::MessageRef,
-        authorized_user_ids: HashSet<String>,
+        elicitation_context: Option<ElicitationContext>,
     ) -> Result<(mpsc::UnboundedReceiver<JsonRpcMessage>, u64)> {
         self.last_active = Instant::now();
         self.activity.touch();
@@ -984,14 +990,15 @@ impl AcpConnection {
 
         let id = self.next_id();
         let authority_id = self.elicitation.open_generation_turn(self.generation);
-        *self.elicitation_turn.lock().await = Some(ElicitationTurnContext {
-            authority_id,
-            session_id: self.acp_session_id.clone(),
-            request_id: Some(id),
-            channel: turn_channel,
-            trigger_message,
-            authorized_user_ids,
-        });
+        *self.elicitation_turn.lock().await =
+            elicitation_context.map(|context| ElicitationTurnContext {
+                authority_id,
+                session_id: self.acp_session_id.clone(),
+                request_id: Some(id),
+                channel: context.channel,
+                trigger_message: context.trigger_message,
+                authorized_user_ids: context.authorized_user_ids,
+            });
 
         // Convert content blocks to JSON
         let prompt_json: Vec<Value> = content_blocks.iter().map(|b| b.to_json()).collect();
@@ -1135,6 +1142,10 @@ impl Drop for AcpConnection {
         }
         let coordinator = self.elicitation.clone();
         let generation = self.generation;
+        // Revocation is synchronous: it blocks new starts and stale UI actions
+        // before Drop returns. Async expiry only resolves the old lease and
+        // updates its UI; neither needs a live child. Thus process kill and UI
+        // cleanup may run in either order without granting successor authority.
         coordinator.revoke_generation(generation);
         tokio::spawn(async move {
             coordinator
@@ -1391,6 +1402,73 @@ mod reader_loop_tests {
 
         drop(agent_stdout_writer);
         handle.await.unwrap();
+    }
+
+    async fn assert_frame_boundary(size: usize, newline: bool, accepted: bool) {
+        let (mut output, input) = duplex(MAX_ACP_FRAME_BYTES + 32);
+        let (writer, _response_reader) = duplex(1024);
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let notify_tx = Arc::new(Mutex::new(Some(tx)));
+        let handle = tokio::spawn(run_reader_loop(
+            input,
+            test_reader_context(Arc::new(Mutex::new(writer)), pending, notify_tx),
+        ));
+        let mut frame = br#"{"jsonrpc":"2.0","method":"boundary"}"#.to_vec();
+        frame.resize(size - usize::from(newline), b' ');
+        if newline {
+            frame.push(b'\n');
+        }
+        output.write_all(&frame).await.unwrap();
+        drop(output);
+        let message = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap();
+        assert_eq!(message.is_some(), accepted);
+        if let Some(message) = message {
+            assert_eq!(message.method.as_deref(), Some("boundary"));
+        }
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reader_accepts_frames_at_limit_with_newline_or_eof() {
+        for size in [
+            8191,
+            8192,
+            8193,
+            MAX_ACP_FRAME_BYTES - 1,
+            MAX_ACP_FRAME_BYTES,
+        ] {
+            assert_frame_boundary(size, true, true).await;
+            assert_frame_boundary(size, false, true).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_rejects_over_limit_with_newline_or_eof() {
+        assert_frame_boundary(MAX_ACP_FRAME_BYTES + 1, true, false).await;
+        assert_frame_boundary(MAX_ACP_FRAME_BYTES + 1, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn reader_preserves_multiple_frames_in_one_chunk_and_final_eof_frame() {
+        let input = b"{\"method\":\"first\"}\n{\"method\":\"second\"}\r\n{\"method\":\"last\"}";
+        let (writer, _response_reader) = duplex(1024);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run_reader_loop(
+            &input[..],
+            test_reader_context(
+                Arc::new(Mutex::new(writer)),
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(Some(tx))),
+            ),
+        )
+        .await;
+        for expected in ["first", "second", "last"] {
+            assert_eq!(rx.recv().await.unwrap().method.as_deref(), Some(expected));
+        }
+        assert!(rx.recv().await.is_none());
     }
 
     #[tokio::test]

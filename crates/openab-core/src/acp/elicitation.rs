@@ -12,6 +12,7 @@ use tokio::sync::{oneshot, Mutex};
 pub const MAX_ELICITATION_BYTES: usize = 64 * 1024;
 pub const MAX_ELICITATION_FIELDS: usize = 50;
 pub const MAX_FIELD_CHOICES: usize = 100;
+pub const MAX_FIELD_PATTERN_CHARS: usize = 512;
 pub const MAX_ACP_FRAME_BYTES: usize = 1024 * 1024;
 
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -34,6 +35,15 @@ impl Default for ConnectionGeneration {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Presentation identity supplied by the verified turn producer.
+/// Connection-owned generation and request authority are assigned separately.
+#[derive(Debug, Clone)]
+pub struct ElicitationContext {
+    pub channel: ChannelRef,
+    pub trigger_message: MessageRef,
+    pub authorized_user_ids: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -354,9 +364,7 @@ impl FormField {
                     )));
                 }
                 if let Some(pattern) = pattern {
-                    let re = regex::Regex::new(pattern)
-                        .map_err(|_| self.invalid("has an invalid pattern constraint"))?;
-                    if !re.is_match(s) {
+                    if !pattern.0.is_match(s) {
                         return Err(self.invalid("does not match the required pattern"));
                     }
                 }
@@ -535,12 +543,22 @@ impl FormField {
     }
 }
 
+/// A pattern compiled once at schema admission, compared by its source text.
+#[derive(Debug, Clone)]
+pub struct FormPattern(regex::Regex);
+
+impl PartialEq for FormPattern {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_str() == other.0.as_str()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum FormFieldKind {
     String {
         min_length: Option<usize>,
         max_length: Option<usize>,
-        pattern: Option<String>,
+        pattern: Option<FormPattern>,
         format: Option<String>,
     },
     Number {
@@ -1144,14 +1162,19 @@ fn optional_regex(
     obj: &Map<String, Value>,
     key: &str,
     field_name: &str,
-) -> std::result::Result<Option<String>, ElicitationError> {
+) -> std::result::Result<Option<FormPattern>, ElicitationError> {
     let Some(pattern) = optional_string(obj, key, field_name)? else {
         return Ok(None);
     };
-    regex::Regex::new(&pattern).map_err(|_| {
+    if pattern.chars().count() > MAX_FIELD_PATTERN_CHARS {
+        return Err(ElicitationError::invalid_params(format!(
+            "field `{field_name}` pattern exceeds {MAX_FIELD_PATTERN_CHARS} characters"
+        )));
+    }
+    let compiled = regex::Regex::new(&pattern).map_err(|_| {
         ElicitationError::invalid_params(format!("field `{field_name}` has an invalid pattern"))
     })?;
-    Ok(Some(pattern))
+    Ok(Some(FormPattern(compiled)))
 }
 
 fn parse_array_kind(
@@ -1434,6 +1457,45 @@ mod tests {
             },
             authorized_user_ids: HashSet::from(["u1".into(), "u2".into()]),
         }
+    }
+
+    #[test]
+    fn rejects_invalid_and_oversize_patterns_at_admission() {
+        for pattern in ["[".to_string(), "a".repeat(MAX_FIELD_PATTERN_CHARS + 1)] {
+            let schema = json!({"type":"object","properties":{
+                "value":{"type":"string","pattern":pattern}
+            }});
+            assert_eq!(
+                FormSchema::from_requested_schema(&schema).unwrap_err().code,
+                -32602
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_pattern_at_character_limit_and_reuses_validation_semantics() {
+        // Count characters, not UTF-8 bytes. Matching remains unanchored unless
+        // the schema supplies anchors, including on repeated validation.
+        let pattern = "é".repeat(MAX_FIELD_PATTERN_CHARS);
+        let form = FormSchema::from_requested_schema(&json!({"type":"object","properties":{
+            "value":{"type":"string","pattern":pattern}
+        }}))
+        .unwrap();
+        for _ in 0..3 {
+            assert!(form.fields[0]
+                .validate_value(&json!(format!("x{pattern}y")))
+                .is_ok());
+            assert!(form.fields[0].validate_value(&json!("no match")).is_err());
+        }
+        let anchored = FormSchema::from_requested_schema(&json!({"type":"object","properties":{
+            "value":{"type":"string","pattern":"^[a-z]+$","default":"abc"}
+        }}))
+        .unwrap();
+        assert!(anchored.fields[0].validate_value(&json!("abc")).is_ok());
+        assert!(anchored.fields[0].validate_value(&json!("abc1")).is_err());
+        assert!(anchored
+            .validate_content(&anchored.default_content())
+            .is_ok());
     }
 
     #[test]

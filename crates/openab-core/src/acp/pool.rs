@@ -412,6 +412,8 @@ impl SessionPool {
         false
     }
 
+    /// Presenter capability must stay stable for a pool session, including suspend/resume.
+    /// Callers must reset the session before changing that capability.
     pub async fn get_or_create(
         &self,
         thread_id: &str,
@@ -439,8 +441,7 @@ impl SessionPool {
         } {
             if existing_capability != requested_form_capability {
                 return Err(anyhow!(
-                    "session capability mismatch for reused session {}",
-                    crate::redact::redact_session_ids(thread_id)
+                    "session capability mismatch; use /reset and try again"
                 ));
             }
         }

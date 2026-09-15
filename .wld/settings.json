@@ -1,3 +1,0 @@
-{
-  "verification_command": "cargo fmt --check && cargo check --workspace && cargo clippy --workspace -- -D warnings && cargo test --workspace"
-}

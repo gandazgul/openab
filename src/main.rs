@@ -892,23 +892,6 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Pre-build shared adapters for cron scheduler and Discord event handling.
-    #[cfg(feature = "discord")]
-    let shared_discord_state: Option<(
-        Arc<discord::DiscordElicitationRegistry>,
-        Arc<discord::DiscordAdapter>,
-    )> = cfg.discord.as_ref().map(|dc| {
-        let http = Arc::new(serenity::http::Http::new(&dc.bot_token));
-        let adapter = Arc::new(discord::DiscordAdapter::new(http));
-        (adapter.elicitation_registry(), adapter)
-    });
-    #[cfg(feature = "discord")]
-    let shared_discord_adapter: Option<Arc<dyn adapter::ChatAdapter>> = shared_discord_state
-        .as_ref()
-        .map(|(_, adapter)| adapter.clone() as Arc<dyn adapter::ChatAdapter>);
-    #[cfg(not(feature = "discord"))]
-    let shared_discord_adapter: Option<Arc<dyn adapter::ChatAdapter>> = None;
-
     let session_ttl_dur = std::time::Duration::from_secs(ttl_secs);
 
     // Initialize multibot cache
@@ -938,6 +921,135 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+
+    #[cfg(feature = "discord")]
+    let discord_client = if let Some(discord_cfg) = cfg.discord.as_ref() {
+        let allow_all_channels = config::resolve_allow_all(
+            discord_cfg.allow_all_channels,
+            &discord_cfg.allowed_channels,
+        );
+        let allow_all_users =
+            config::resolve_allow_all(discord_cfg.allow_all_users, &discord_cfg.allowed_users);
+        let allowed_channels =
+            parse_id_set(&discord_cfg.allowed_channels, "discord.allowed_channels")?;
+        if !allow_all_channels && allowed_channels.is_empty() {
+            warn!("allow_all_channels=false with empty allowed_channels for Discord — bot will deny all channels");
+        }
+        let allowed_users = parse_id_set(&discord_cfg.allowed_users, "discord.allowed_users")?;
+        let trusted_bot_ids =
+            parse_id_set(&discord_cfg.trusted_bot_ids, "discord.trusted_bot_ids")?;
+        let allowed_role_ids =
+            parse_id_set(&discord_cfg.allowed_role_ids, "discord.allowed_role_ids")?;
+        info!(
+            allow_all_channels,
+            allow_all_users,
+            channels = allowed_channels.len(),
+            users = allowed_users.len(),
+            trusted_bots = trusted_bot_ids.len(),
+            role_triggers = allowed_role_ids.len(),
+            allow_bot_messages = ?discord_cfg.allow_bot_messages,
+            allow_user_messages = ?discord_cfg.allow_user_messages,
+            allow_dm = discord_cfg.allow_dm,
+            "starting discord adapter"
+        );
+
+        let (discord_cap, discord_grouping, discord_idle) = dispatch::dispatch_params(
+            &discord_cfg.message_processing_mode,
+            discord_cfg.max_buffered_messages,
+        );
+        let discord_dispatcher = Arc::new(dispatch::Dispatcher::with_idle_timeout(
+            router.clone(),
+            discord_cap,
+            discord_cfg.max_batch_tokens,
+            discord_grouping,
+            discord_idle,
+        ));
+        dispatchers.lock().unwrap().push(discord_dispatcher.clone());
+
+        // Initialize reminder store
+        let reminder_path = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join(".openab")
+            .join("reminders.json");
+        let reminder_store = remind::ReminderStore::load(reminder_path);
+
+        // Construct ambient dispatcher if enabled and channels configured.
+        let ambient_dispatcher = if cfg.ambient.enabled && !cfg.ambient.discord.channels.is_empty()
+        {
+            info!(
+                channels = ?cfg.ambient.discord.channels,
+                flush_interval = cfg.ambient.flush_interval_seconds,
+                flush_max_messages = cfg.ambient.flush_max_messages,
+                "ambient mode enabled"
+            );
+            Some(Arc::new(openab_core::ambient::AmbientDispatcher::new(
+                cfg.ambient.clone(),
+            )))
+        } else {
+            None
+        };
+
+        let handler = Arc::new(discord::Handler {
+            router: router.clone(),
+            allow_all_channels,
+            allow_all_users,
+            allowed_channels,
+            allowed_users,
+            stt_config: cfg.stt.clone(),
+            adapter: std::sync::OnceLock::new(),
+            elicitation: std::sync::OnceLock::new(),
+            #[cfg(feature = "filestore")]
+            filestore: filestore.clone(),
+            allow_bot_messages: discord_cfg.allow_bot_messages,
+            trusted_bot_ids,
+            allow_user_messages: discord_cfg.allow_user_messages,
+            allowed_role_ids,
+            participated_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            multibot_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            multibot_cache: multibot_cache.clone(),
+            session_ttl: std::time::Duration::from_secs(ttl_secs),
+            max_bot_turns: discord_cfg.max_bot_turns,
+            bot_turns: tokio::sync::Mutex::new(bot_turns::BotTurnTracker::new(
+                discord_cfg.max_bot_turns,
+            )),
+            allow_dm: discord_cfg.allow_dm,
+            dispatcher: discord_dispatcher,
+            ambient: ambient_dispatcher,
+            reminder_store: reminder_store.clone(),
+            scheduled_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+        });
+
+        let intents = GatewayIntents::GUILD_MESSAGES
+            | GatewayIntents::MESSAGE_CONTENT
+            | GatewayIntents::GUILDS
+            | GatewayIntents::DIRECT_MESSAGES
+            | GatewayIntents::GUILD_MESSAGE_REACTIONS;
+
+        let client = Client::builder(&discord_cfg.bot_token, intents)
+            .event_handler_arc(handler.clone())
+            .await?;
+
+        // The presenter, event handler, cron, and control socket share the client's ratelimiter.
+        let adapter = Arc::new(discord::DiscordAdapter::new(client.http.clone()));
+        assert!(handler
+            .elicitation
+            .set(adapter.elicitation_registry())
+            .is_ok());
+        assert!(handler
+            .adapter
+            .set(adapter as Arc<dyn adapter::ChatAdapter>)
+            .is_ok());
+        Some((client, handler))
+    } else {
+        None
+    };
+    #[cfg(feature = "discord")]
+    let shared_discord_adapter: Option<Arc<dyn adapter::ChatAdapter>> = discord_client
+        .as_ref()
+        .and_then(|(_, handler)| handler.adapter.get().cloned());
+    #[cfg(not(feature = "discord"))]
+    let shared_discord_adapter: Option<Arc<dyn adapter::ChatAdapter>> = None;
 
     #[cfg(feature = "slack")]
     let shared_slack_adapter: Option<Arc<slack::SlackAdapter>> = cfg.slack.as_ref().map(|s| {
@@ -1626,124 +1738,9 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Run Discord adapter (foreground, blocking) or wait for ctrl_c
+    // Run Discord adapter (foreground, blocking) or wait for ctrl_c.
     #[cfg(feature = "discord")]
-    if let Some(discord_cfg) = cfg.discord {
-        let allow_all_channels = config::resolve_allow_all(
-            discord_cfg.allow_all_channels,
-            &discord_cfg.allowed_channels,
-        );
-        let allow_all_users =
-            config::resolve_allow_all(discord_cfg.allow_all_users, &discord_cfg.allowed_users);
-        let allowed_channels =
-            parse_id_set(&discord_cfg.allowed_channels, "discord.allowed_channels")?;
-        if !allow_all_channels && allowed_channels.is_empty() {
-            warn!("allow_all_channels=false with empty allowed_channels for Discord — bot will deny all channels");
-        }
-        let allowed_users = parse_id_set(&discord_cfg.allowed_users, "discord.allowed_users")?;
-        let trusted_bot_ids =
-            parse_id_set(&discord_cfg.trusted_bot_ids, "discord.trusted_bot_ids")?;
-        let allowed_role_ids =
-            parse_id_set(&discord_cfg.allowed_role_ids, "discord.allowed_role_ids")?;
-        info!(
-            allow_all_channels,
-            allow_all_users,
-            channels = allowed_channels.len(),
-            users = allowed_users.len(),
-            trusted_bots = trusted_bot_ids.len(),
-            role_triggers = allowed_role_ids.len(),
-            allow_bot_messages = ?discord_cfg.allow_bot_messages,
-            allow_user_messages = ?discord_cfg.allow_user_messages,
-            allow_dm = discord_cfg.allow_dm,
-            "starting discord adapter"
-        );
-
-        let (discord_cap, discord_grouping, discord_idle) = dispatch::dispatch_params(
-            &discord_cfg.message_processing_mode,
-            discord_cfg.max_buffered_messages,
-        );
-        let discord_dispatcher = Arc::new(dispatch::Dispatcher::with_idle_timeout(
-            router.clone(),
-            discord_cap,
-            discord_cfg.max_batch_tokens,
-            discord_grouping,
-            discord_idle,
-        ));
-        dispatchers.lock().unwrap().push(discord_dispatcher.clone());
-
-        // Initialize reminder store
-        let reminder_path = std::env::var("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_default()
-            .join(".openab")
-            .join("reminders.json");
-        let reminder_store = remind::ReminderStore::load(reminder_path);
-
-        // Construct ambient dispatcher if enabled and channels configured.
-        let ambient_dispatcher = if cfg.ambient.enabled && !cfg.ambient.discord.channels.is_empty()
-        {
-            info!(
-                channels = ?cfg.ambient.discord.channels,
-                flush_interval = cfg.ambient.flush_interval_seconds,
-                flush_max_messages = cfg.ambient.flush_max_messages,
-                "ambient mode enabled"
-            );
-            Some(Arc::new(openab_core::ambient::AmbientDispatcher::new(
-                cfg.ambient.clone(),
-            )))
-        } else {
-            None
-        };
-
-        let handler = discord::Handler {
-            router,
-            allow_all_channels,
-            allow_all_users,
-            allowed_channels,
-            allowed_users,
-            stt_config: cfg.stt.clone(),
-            adapter: {
-                let lock = std::sync::OnceLock::new();
-                if let Some((_, adapter)) = shared_discord_state.as_ref() {
-                    let _ = lock.set(adapter.clone() as Arc<dyn adapter::ChatAdapter>);
-                }
-                lock
-            },
-            elicitation: shared_discord_state
-                .as_ref()
-                .map(|(registry, _)| registry.clone())
-                .expect("discord handler requires shared Discord state"),
-            #[cfg(feature = "filestore")]
-            filestore: filestore.clone(),
-            allow_bot_messages: discord_cfg.allow_bot_messages,
-            trusted_bot_ids,
-            allow_user_messages: discord_cfg.allow_user_messages,
-            allowed_role_ids,
-            participated_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-            multibot_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-            multibot_cache,
-            session_ttl: std::time::Duration::from_secs(ttl_secs),
-            max_bot_turns: discord_cfg.max_bot_turns,
-            bot_turns: tokio::sync::Mutex::new(bot_turns::BotTurnTracker::new(
-                discord_cfg.max_bot_turns,
-            )),
-            allow_dm: discord_cfg.allow_dm,
-            dispatcher: discord_dispatcher,
-            ambient: ambient_dispatcher,
-            reminder_store: reminder_store.clone(),
-            scheduled_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
-        };
-
-        let intents = GatewayIntents::GUILD_MESSAGES
-            | GatewayIntents::MESSAGE_CONTENT
-            | GatewayIntents::GUILDS
-            | GatewayIntents::DIRECT_MESSAGES
-            | GatewayIntents::GUILD_MESSAGE_REACTIONS;
-
-        let mut client = Client::builder(&discord_cfg.bot_token, intents)
-            .event_handler(handler)
-            .await?;
-
+    if let Some((mut client, _handler)) = discord_client {
         let shard_manager = client.shard_manager.clone();
         tokio::spawn(async move {
             shutdown_signal().await;

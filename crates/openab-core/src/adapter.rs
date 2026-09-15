@@ -1,3 +1,4 @@
+use crate::acp::elicitation::ElicitationContext;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Serialize;
@@ -671,8 +672,11 @@ impl AdapterRouter {
                 &thread_key,
                 content_blocks,
                 &ctx.thread_channel,
-                ctx.trigger_msg.clone(),
-                human_authority_from_sender_json(&ctx.sender_json),
+                adapter.form_presenter().map(|_| ElicitationContext {
+                    channel: ctx.thread_channel.clone(),
+                    trigger_message: ctx.trigger_msg.clone(),
+                    authorized_user_ids: human_authority_from_sender_json(&ctx.sender_json),
+                }),
                 reactions.clone(),
                 ctx.other_bot_present,
                 // handle_message path (e.g. cron) is never Slack assistant-mode native
@@ -720,16 +724,13 @@ impl AdapterRouter {
         thread_key: &str,
         content_blocks: Vec<ContentBlock>,
         thread_channel: &ChannelRef,
-        trigger_msg: MessageRef,
-        authorized_user_ids: HashSet<String>,
+        elicitation_context: Option<ElicitationContext>,
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
         recipient: Option<(String, String)>,
     ) -> Result<()> {
         let adapter = adapter.clone();
         let thread_channel = thread_channel.clone();
-        let trigger_msg = trigger_msg.clone();
-        let authorized_user_ids = authorized_user_ids.clone();
         let message_limit = reply_message_limit(&thread_channel.platform, adapter.message_limit());
         // Decide streaming explicitly by platform, not by whatever the unified
         // adapter's Telegram flag happens to be. ACP streams append-only deltas
@@ -772,12 +773,7 @@ impl AdapterRouter {
                     conn.session_reset = false;
 
                     let (mut rx, request_id) = conn
-                        .session_prompt(
-                            content_blocks,
-                            thread_channel.clone(),
-                            trigger_msg.clone(),
-                            authorized_user_ids.clone(),
-                        )
+                        .session_prompt(content_blocks, elicitation_context)
                         .await?;
                     if assistant_status {
                         let _ = adapter.set_status(&thread_channel, "Thinking…").await;

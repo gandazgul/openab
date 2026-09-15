@@ -181,7 +181,7 @@ OpenAB supports flat ACP form schemas with these field types:
 - string-array multi-select enums;
 - required fields and defaults.
 
-The form is progressive. Users answer one field at a time, review the values, can modify fields, and then choose **Submit**, **Decline**, or **Cancel**. Long form text is split into pages so the prompt, descriptions, choices, defaults, errors, and review values stay visible in Discord. If a Discord select cannot safely represent a field, OpenAB asks the user to reply directly to the form message with the value. Other messages continue through normal dispatch.
+The form is progressive. Users answer one field at a time, review the values, can modify fields, and then choose **Submit**, **Decline**, or **Cancel**. Long form text is split into pages so the prompt, descriptions, choices, defaults, errors, and review values stay visible in Discord. If a Discord select cannot safely represent a field, OpenAB asks the user to reply directly to the form message with the value. Other messages continue through normal dispatch. Replies to inactive forms or from unauthorized users receive a notice and are not sent to the agent. If OpenAB cannot retrieve a reply target to check whether it is a form, it also withholds the reply and sends a notice. Send a new message, not a reply, for a normal request.
 
 In text fallback, reply directly to the active form message. You can type the value for the current field, or use these commands:
 
@@ -190,14 +190,16 @@ In text fallback, reply directly to the active form message. You can type the va
 - `!form edit N` — edit field number `N` from review.
 - `!form skip` — omit the current optional field.
 - `!form submit`, `!form decline`, `!form cancel` — finish the form.
-- `!form value <JSON value>` — send an exact typed value.
+- `!form value <JSON value>` — send an exact typed value. For example, use `!form value "hello"` for a string, `!form value 42` for a number, `!form value true` for a boolean, or `!form value ["a", "b"]` for a multi-select field. Values must meet the current field constraints.
 - `!form choose N` or `!form choose N M ...` — select numbered choices.
+
+The **Modify** button keeps the review visible and shows how to reply with `!form edit N`. Use the field number shown in the review. Put a space after `!form`; `!formnext` is not a command.
 
 Only verified human users who contributed to the exact active turn can answer. In a per-thread batch, any human contributor in that batch can answer. Later users, allowlisted users who did not contribute, channel members, and bots cannot answer. Old buttons, modals, selects, and text replies are rejected after Submit, Decline, Cancel, `/cancel`, `/reset`, process exit, eviction, or the parent turn timeout.
 
 Do not use form elicitation for secrets. The form warns users not to enter passwords, API keys, tokens, private keys, recovery codes, payment credentials, or other credentials. Agents must use another safe flow for sensitive interactions.
 
-OpenAB bounds Agent-controlled form work. One connection can have one pending form. An elicitation request over 64 KiB, a form over 50 fields, or a field over 100 choices is rejected before display. The inbound ACP line limit is 1 MiB.
+OpenAB bounds Agent-controlled form work. One connection can have one pending form. An elicitation request over 64 KiB, a form over 50 fields, or a field over 100 choices is rejected before display. String patterns are limited to 512 characters and are compiled before the form is displayed. The inbound ACP line limit is 1 MiB.
 
 ---
 

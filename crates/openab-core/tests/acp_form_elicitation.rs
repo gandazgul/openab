@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use openab_core::acp::connection::AcpConnection;
 use openab_core::acp::elicitation::{
-    ElicitationOutcome, ElicitationPresentation, ElicitationStatus, FormPresenter,
+    ElicitationContext, ElicitationOutcome, ElicitationPresentation, ElicitationStatus,
+    FormPresenter,
 };
 use openab_core::acp::ContentBlock;
 use openab_core::acp::SessionPool;
@@ -175,9 +176,11 @@ async fn fake_runtime_observes_discord_form_capability_and_completes_prompt() {
             vec![ContentBlock::Text {
                 text: "hello".into(),
             }],
-            channel(),
-            trigger_message(),
-            HashSet::from(["user-a".to_string(), "user-b".to_string()]),
+            Some(ElicitationContext {
+                channel: channel(),
+                trigger_message: trigger_message(),
+                authorized_user_ids: HashSet::from(["user-a".to_string(), "user-b".to_string()]),
+            }),
         )
         .await
         .unwrap();
@@ -257,9 +260,11 @@ async fn cancel_response_keeps_string_request_id_on_wire() {
             vec![ContentBlock::Text {
                 text: "hello".into(),
             }],
-            channel(),
-            trigger_message(),
-            HashSet::from(["user-a".to_string()]),
+            Some(ElicitationContext {
+                channel: channel(),
+                trigger_message: trigger_message(),
+                authorized_user_ids: HashSet::from(["user-a".to_string()]),
+            }),
         )
         .await
         .unwrap();
@@ -271,6 +276,126 @@ async fn cancel_response_keeps_string_request_id_on_wire() {
     assert!(matches!(
         presentation.agent_request_id,
         openab_core::acp::protocol::JsonRpcId::String(ref id) if id == "elicitation-a"
+    ));
+    outcome_tx.send(ElicitationOutcome::Cancel).unwrap();
+
+    loop {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if msg
+            .id
+            .as_ref()
+            .and_then(openab_core::acp::protocol::JsonRpcId::as_u64)
+            == Some(request_id)
+        {
+            break;
+        }
+    }
+    assert_eq!(expired_rx.recv().await, Some(ElicitationStatus::Cancelled));
+    conn.prompt_done().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_decline_delivery_expires_form() {
+    assert_failed_delivery_expires_form(ElicitationOutcome::Decline).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_accept_delivery_expires_form() {
+    assert_failed_delivery_expires_form(ElicitationOutcome::Accept(serde_json::Map::from_iter([
+        ("name".to_string(), json!("Ada")),
+    ])))
+    .await;
+}
+
+#[cfg(unix)]
+async fn assert_failed_delivery_expires_form(outcome: ElicitationOutcome) {
+    let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+    let (outcome_tx, outcome_rx) = mpsc::unbounded_channel();
+    let (expired_tx, mut expired_rx) = mpsc::unbounded_channel();
+    let presenter = Arc::new(RecordingPresenter {
+        seen_tx,
+        outcome_rx: Arc::new(Mutex::new(outcome_rx)),
+        expired_tx,
+    });
+
+    let mut conn = spawn_fake("closed_stdin", Some(presenter)).await.unwrap();
+    conn.initialize().await.unwrap();
+    conn.session_new(".").await.unwrap();
+    let (_rx, _request_id) = conn
+        .session_prompt(
+            vec![ContentBlock::Text {
+                text: "hello".into(),
+            }],
+            Some(ElicitationContext {
+                channel: channel(),
+                trigger_message: trigger_message(),
+                authorized_user_ids: HashSet::from(["user-a".to_string()]),
+            }),
+        )
+        .await
+        .unwrap();
+
+    let presentation = tokio::time::timeout(std::time::Duration::from_secs(2), seen_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        presentation.agent_request_id,
+        openab_core::acp::protocol::JsonRpcId::String(ref id) if id == "elicitation-a"
+    ));
+    outcome_tx.send(outcome).unwrap();
+
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), expired_rx.recv())
+            .await
+            .unwrap(),
+        Some(ElicitationStatus::Expired)
+    );
+    conn.prompt_done().await;
+}
+
+#[tokio::test]
+async fn cancel_response_keeps_negative_request_id_on_wire() {
+    let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+    let (outcome_tx, outcome_rx) = mpsc::unbounded_channel();
+    let (expired_tx, mut expired_rx) = mpsc::unbounded_channel();
+    let presenter = Arc::new(RecordingPresenter {
+        seen_tx,
+        outcome_rx: Arc::new(Mutex::new(outcome_rx)),
+        expired_tx,
+    });
+
+    let mut conn = spawn_fake("cancel_negative_id", Some(presenter))
+        .await
+        .unwrap();
+    conn.initialize().await.unwrap();
+    conn.session_new(".").await.unwrap();
+    let (mut rx, request_id) = conn
+        .session_prompt(
+            vec![ContentBlock::Text {
+                text: "hello".into(),
+            }],
+            Some(ElicitationContext {
+                channel: channel(),
+                trigger_message: trigger_message(),
+                authorized_user_ids: HashSet::from(["user-a".to_string()]),
+            }),
+        )
+        .await
+        .unwrap();
+
+    let presentation = tokio::time::timeout(std::time::Duration::from_secs(2), seen_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        presentation.agent_request_id,
+        openab_core::acp::protocol::JsonRpcId::Number(-1)
     ));
     outcome_tx.send(ElicitationOutcome::Cancel).unwrap();
 
@@ -319,9 +444,11 @@ async fn abandon_request_invalidates_pending_elicitation() {
             vec![ContentBlock::Text {
                 text: "hello".into(),
             }],
-            channel(),
-            trigger_message(),
-            HashSet::from(["user-a".to_string()]),
+            Some(ElicitationContext {
+                channel: channel(),
+                trigger_message: trigger_message(),
+                authorized_user_ids: HashSet::from(["user-a".to_string()]),
+            }),
         )
         .await
         .unwrap();
@@ -428,9 +555,11 @@ async fn pool_with_pending_elicitation(
                 vec![ContentBlock::Text {
                     text: "hello".into(),
                 }],
-                channel(),
-                trigger_message(),
-                HashSet::from(["user-a".to_string()]),
+                Some(ElicitationContext {
+                    channel: channel(),
+                    trigger_message: trigger_message(),
+                    authorized_user_ids: HashSet::from(["user-a".to_string()]),
+                }),
             )
             .await
             .map(|_| ())
@@ -439,6 +568,25 @@ async fn pool_with_pending_elicitation(
     .await
     .unwrap();
     (pool, seen_rx, expired_rx, outcome_tx)
+}
+
+#[tokio::test]
+async fn capability_mismatch_gives_reset_hint_without_session_key() {
+    let (pool, mut seen_rx, _expired_rx, _outcome_tx) =
+        pool_with_pending_elicitation("deadline_cancel").await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), seen_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let error = pool
+        .get_or_create("discord:10", None, None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("/reset"));
+    assert!(!error.contains("discord"));
+    assert!(!error.contains("10"));
+    pool.reset_session("discord:10").await.unwrap();
 }
 
 #[tokio::test]
@@ -451,7 +599,12 @@ async fn reset_session_invalidates_pending_elicitation() {
         .unwrap()
         .unwrap();
     pool.reset_session("discord:10").await.unwrap();
-    assert_eq!(expired_rx.recv().await, Some(ElicitationStatus::Cancelled));
+    // Cleanup can close the child before the Cancel response is delivered.
+    // A closed response pipe must report Expired, never successful delivery.
+    assert!(matches!(
+        expired_rx.recv().await,
+        Some(ElicitationStatus::Cancelled | ElicitationStatus::Expired)
+    ));
 }
 
 #[tokio::test]
@@ -472,7 +625,12 @@ async fn idle_eviction_invalidates_pending_elicitation() {
     .await
     .unwrap();
     pool.cleanup_idle(0).await;
-    assert_eq!(expired_rx.recv().await, Some(ElicitationStatus::Cancelled));
+    // Cleanup can close the child before the Cancel response is delivered.
+    // A closed response pipe must report Expired, never successful delivery.
+    assert!(matches!(
+        expired_rx.recv().await,
+        Some(ElicitationStatus::Cancelled | ElicitationStatus::Expired)
+    ));
 }
 
 #[tokio::test]
@@ -494,9 +652,11 @@ async fn agent_eof_invalidates_pending_elicitation() {
             vec![ContentBlock::Text {
                 text: "hello".into(),
             }],
-            channel(),
-            trigger_message(),
-            HashSet::from(["user-a".to_string()]),
+            Some(ElicitationContext {
+                channel: channel(),
+                trigger_message: trigger_message(),
+                authorized_user_ids: HashSet::from(["user-a".to_string()]),
+            }),
         )
         .await
         .unwrap();
@@ -511,7 +671,12 @@ async fn agent_eof_invalidates_pending_elicitation() {
             .unwrap()
             .is_none()
     );
-    assert_eq!(expired_rx.recv().await, Some(ElicitationStatus::Cancelled));
+    // Cleanup can close the child before the Cancel response is delivered.
+    // A closed response pipe must report Expired, never successful delivery.
+    assert!(matches!(
+        expired_rx.recv().await,
+        Some(ElicitationStatus::Cancelled | ElicitationStatus::Expired)
+    ));
     assert_eq!(conn.pending_elicitations().await, 0);
 }
 
@@ -534,9 +699,11 @@ async fn excess_reverse_requests_get_bounded_errors_while_prompt_stays_live() {
             vec![ContentBlock::Text {
                 text: "hello".into(),
             }],
-            channel(),
-            trigger_message(),
-            HashSet::from(["user-a".to_string()]),
+            Some(ElicitationContext {
+                channel: channel(),
+                trigger_message: trigger_message(),
+                authorized_user_ids: HashSet::from(["user-a".to_string()]),
+            }),
         )
         .await
         .unwrap();
@@ -644,6 +811,23 @@ fn run_fake_agent(scenario: &str) {
             assert_eq!(result["id"], prompt_id);
             assert_eq!(result["result"]["action"], "accept");
             assert_eq!(result["result"]["content"]["strategy"], "balanced");
+        }
+        #[cfg(unix)]
+        "closed_stdin" => {
+            // Close only the response pipe. Keep stdout live so EOF cleanup cannot
+            // mask the actual response-write failure under test.
+            unsafe {
+                libc::close(libc::STDIN_FILENO);
+            }
+            request_elicitation(&mut out, json!("elicitation-a"), small_schema());
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            return;
+        }
+        "cancel_negative_id" => {
+            request_elicitation(&mut out, json!(-1), small_schema());
+            let result = read_json(&mut lines);
+            assert_eq!(result["id"], -1);
+            assert_eq!(result["result"]["action"], "cancel");
         }
         "cancel_string_id" => {
             request_elicitation(&mut out, json!("elicitation-a"), small_schema());
