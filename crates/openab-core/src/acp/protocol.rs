@@ -4,22 +4,24 @@ use serde_json::Value;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum JsonRpcId {
-    Number(i64),
+    Unsigned(u64),
+    Signed(i64),
     String(String),
 }
 
 impl JsonRpcId {
     pub fn as_u64(&self) -> Option<u64> {
         match self {
-            Self::Number(id) if *id >= 0 => Some(*id as u64),
-            Self::Number(_) | Self::String(_) => None,
+            Self::Unsigned(id) => Some(*id),
+            Self::Signed(id) => (*id).try_into().ok(),
+            Self::String(_) => None,
         }
     }
 }
 
 impl From<u64> for JsonRpcId {
     fn from(value: u64) -> Self {
-        Self::Number(value as i64)
+        Self::Unsigned(value)
     }
 }
 
@@ -62,6 +64,27 @@ impl JsonRpcResponse {
     }
 }
 
+#[derive(Debug, Serialize)]
+pub struct JsonRpcErrorResponse {
+    pub jsonrpc: &'static str,
+    pub id: JsonRpcId,
+    pub error: JsonRpcError,
+}
+
+impl JsonRpcErrorResponse {
+    pub fn new(id: impl Into<JsonRpcId>, code: i64, message: impl Into<String>) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            id: id.into(),
+            error: JsonRpcError {
+                code,
+                message: message.into(),
+                data: None,
+            },
+        }
+    }
+}
+
 // --- Incoming ---
 
 #[derive(Debug, Deserialize)]
@@ -73,12 +96,13 @@ pub struct JsonRpcMessage {
     pub params: Option<Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcError {
     pub code: i64,
     pub message: String,
     /// Optional structured data from the agent (JSON-RPC `error.data`).
     /// Agents like codex-acp include `{"message": "...", "codex_error_info": "..."}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
 }
 
@@ -443,6 +467,31 @@ pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn json_rpc_ids_preserve_all_supported_integer_ranges() {
+        for value in [0, i64::MAX as u64, (i64::MAX as u64) + 1, u64::MAX] {
+            let message: JsonRpcMessage = serde_json::from_value(json!({ "id": value })).unwrap();
+            let id = message.id.unwrap();
+
+            assert_eq!(id.as_u64(), Some(value));
+            assert_eq!(serde_json::to_value(&id).unwrap(), json!(value));
+            assert_eq!(JsonRpcId::from(value).as_u64(), Some(value));
+        }
+
+        for value in [-1, i64::MIN] {
+            let message: JsonRpcMessage = serde_json::from_value(json!({ "id": value })).unwrap();
+            let id = message.id.unwrap();
+
+            assert_eq!(id.as_u64(), None);
+            assert_eq!(serde_json::to_value(id).unwrap(), json!(value));
+        }
+
+        let message: JsonRpcMessage =
+            serde_json::from_value(json!({ "id": "agent-request" })).unwrap();
+        assert_eq!(message.id.unwrap().as_u64(), None);
+        assert!(serde_json::from_value::<JsonRpcMessage>(json!({ "id": 1.5 })).is_err());
+    }
 
     #[test]
     fn parse_standard_config_options() {
