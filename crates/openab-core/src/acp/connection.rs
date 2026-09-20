@@ -1,6 +1,6 @@
 use crate::acp::protocol::{
-    parse_config_options, parse_usage_report, ConfigOption, JsonRpcMessage, JsonRpcRequest,
-    JsonRpcResponse, UsageReport,
+    parse_config_options, parse_usage_report, ConfigOption, JsonRpcId, JsonRpcMessage,
+    JsonRpcRequest, JsonRpcResponse, UsageReport,
 };
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -257,9 +257,9 @@ pub(crate) async fn run_reader_loop<R, W>(
         };
         debug!(line = line.trim(), "acp_recv");
 
-        // Auto-reply session/request_permission
-        if msg.method.as_deref() == Some("session/request_permission") {
-            if let Some(id) = msg.id {
+        // Agent-to-client requests must be classified before outbound response matching.
+        if let (Some(method), Some(agent_request_id)) = (msg.method.as_deref(), msg.id.clone()) {
+            if method == "session/request_permission" {
                 let title = msg
                     .params
                     .as_ref()
@@ -270,18 +270,33 @@ pub(crate) async fn run_reader_loop<R, W>(
 
                 let outcome = build_permission_response(msg.params.as_ref());
                 info!(title, %outcome, "auto-respond permission");
-                let reply = JsonRpcResponse::new(id, outcome);
+                let reply = JsonRpcResponse::new(agent_request_id, outcome);
                 if let Ok(data) = serde_json::to_string(&reply) {
                     let mut w = writer.lock().await;
                     let _ = w.write_all(format!("{data}\n").as_bytes()).await;
                     let _ = w.flush().await;
                 }
+                continue;
+            }
+
+            let reply = json!({
+                "jsonrpc": "2.0",
+                "id": agent_request_id,
+                "error": {
+                    "code": -32601,
+                    "message": format!("unsupported agent request method `{method}`"),
+                },
+            });
+            if let Ok(data) = serde_json::to_string(&reply) {
+                let mut w = writer.lock().await;
+                let _ = w.write_all(format!("{data}\n").as_bytes()).await;
+                let _ = w.flush().await;
             }
             continue;
         }
 
-        // Response (has id) → resolve pending AND forward to subscriber
-        if let Some(id) = msg.id {
+        // Response (numeric id) → resolve pending AND forward to subscriber
+        if let Some(id) = msg.id.as_ref().and_then(JsonRpcId::as_u64) {
             let mut map = pending.lock().await;
             if let Some(tx) = map.remove(&id) {
                 // Forward to subscriber so they see the completion
@@ -289,7 +304,7 @@ pub(crate) async fn run_reader_loop<R, W>(
                 if let Some(ntx) = sub.as_ref() {
                     // Clone the essential fields for the subscriber
                     let _ = ntx.send(JsonRpcMessage {
-                        id: Some(id),
+                        id: Some(JsonRpcId::Number(id as i64)),
                         method: None,
                         result: msg.result.clone(),
                         error: msg.error.clone(),
@@ -1029,7 +1044,7 @@ mod reader_loop_tests {
             .await
             .expect("subscriber should receive stale message before timeout")
             .expect("subscriber channel should not be closed");
-        assert_eq!(forwarded.id, Some(42));
+        assert_eq!(forwarded.id, Some(JsonRpcId::Number(42)));
         assert!(pending.lock().await.is_empty());
 
         drop(agent_stdout_writer);
@@ -1072,14 +1087,100 @@ mod reader_loop_tests {
             .await
             .expect("oneshot should resolve")
             .expect("oneshot should not be cancelled");
-        assert_eq!(resolved.id, Some(7));
+        assert_eq!(resolved.id, Some(JsonRpcId::Number(7)));
 
         let forwarded = tokio::time::timeout(std::time::Duration::from_secs(2), sub_rx.recv())
             .await
             .expect("subscriber should receive forwarded copy")
             .expect("subscriber channel should not be closed");
-        assert_eq!(forwarded.id, Some(7));
+        assert_eq!(forwarded.id, Some(JsonRpcId::Number(7)));
         assert!(pending.lock().await.is_empty());
+
+        drop(agent_stdout_writer);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_request_does_not_consume_colliding_pending_response() {
+        let (mut agent_stdout_writer, agent_stdout_reader) = duplex(8 * 1024);
+        let (agent_stdin_writer, agent_stdin_reader) = duplex(8 * 1024);
+
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (resp_tx, mut resp_rx) = oneshot::channel();
+        pending.lock().await.insert(7, resp_tx);
+        let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(None));
+
+        let handle = tokio::spawn(run_reader_loop(
+            agent_stdout_reader,
+            Arc::new(Mutex::new(agent_stdin_writer)),
+            pending.clone(),
+            notify_tx,
+        ));
+
+        let request = b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"agent/test\",\"params\":{}}\n";
+        agent_stdout_writer.write_all(request).await.unwrap();
+        agent_stdout_writer.flush().await.unwrap();
+
+        let mut response = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            BufReader::new(agent_stdin_reader).read_line(&mut response),
+        )
+        .await
+        .expect("unsupported request should receive a response")
+        .expect("response should be readable");
+        let response: Value = serde_json::from_str(response.trim()).unwrap();
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["error"]["code"], -32601);
+        assert!(pending.lock().await.contains_key(&7));
+        assert!(matches!(
+            resp_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        pending.lock().await.remove(&7);
+        drop(agent_stdout_writer);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unsupported_agent_requests_echo_string_and_negative_ids() {
+        let (mut agent_stdout_writer, agent_stdout_reader) = duplex(8 * 1024);
+        let (agent_stdin_writer, agent_stdin_reader) = duplex(8 * 1024);
+        let handle = tokio::spawn(run_reader_loop(
+            agent_stdout_reader,
+            Arc::new(Mutex::new(agent_stdin_writer)),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(None)),
+        ));
+        let mut response_reader = BufReader::new(agent_stdin_reader);
+
+        for (raw_id, expected_id) in [
+            ("\"agent-request\"", json!("agent-request")),
+            ("-1", json!(-1)),
+        ] {
+            let request =
+                format!("{{\"jsonrpc\":\"2.0\",\"id\":{raw_id},\"method\":\"agent/test\"}}\n");
+            agent_stdout_writer
+                .write_all(request.as_bytes())
+                .await
+                .unwrap();
+            agent_stdout_writer.flush().await.unwrap();
+
+            let mut response = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                response_reader.read_line(&mut response),
+            )
+            .await
+            .expect("unsupported request should receive a response")
+            .expect("response should be readable");
+            let response: Value = serde_json::from_str(response.trim()).unwrap();
+            assert_eq!(response["id"], expected_id);
+            assert_eq!(response["error"]["code"], -32601);
+        }
 
         drop(agent_stdout_writer);
         handle.await.unwrap();
