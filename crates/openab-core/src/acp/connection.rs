@@ -12,7 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 /// Pick the most permissive selectable permission option from ACP options.
 fn pick_best_option(options: &[Value]) -> Option<String> {
@@ -289,6 +289,13 @@ pub(crate) async fn run_reader_loop<R, W>(
                 continue;
             }
 
+            // OpenAB advertises `clientCapabilities: {}`, so any other
+            // agent-to-client request is a capability we never offered.
+            // Surface it at warn level rather than only in the debug frame dump.
+            warn!(
+                method,
+                "unsupported agent-to-client request; replying -32601"
+            );
             let reply = JsonRpcErrorResponse::new(
                 agent_request_id,
                 -32601,

@@ -1,6 +1,14 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// JSON-RPC 2.0 request/response id.
+///
+/// Deserialization is untagged and tries the variants in declaration order, so
+/// every non-negative integer (up to `u64::MAX`) lands in `Unsigned` and
+/// `Signed` only ever holds negative values. Do not construct
+/// `Signed(n)` for `n >= 0` by hand: the derived `PartialEq`/`Hash` are
+/// structural, so `Unsigned(5) != Signed(5)`. Compare via [`Self::as_u64`]
+/// when correlating against OpenAB's own `u64` request ids.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum JsonRpcId {
